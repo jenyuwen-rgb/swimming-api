@@ -1,12 +1,16 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
-from sqlalchemy.orm import Session
+# app/routes.py
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
+from sqlalchemy.orm import Session
+from typing import List, Dict, Any, Optional
+import re
+
 from .db import SessionLocal
-from .utils_swim import convert_to_seconds, simplify_category, normalize_distance_item, calc_wa
 
 router = APIRouter()
 
-# Dependency - 提供 DB session
+# ---------- helpers ----------
+
 def get_db():
     db = SessionLocal()
     try:
@@ -14,107 +18,132 @@ def get_db():
     finally:
         db.close()
 
-@router.get("/health")
-def health():
-    return {"ok": True}
+def parse_seconds(s: Optional[str]) -> Optional[float]:
+    if not s:
+        return None
+    s = s.strip()
+    # formats: "00:37.81", "1:12.34", "37.28"
+    try:
+        if ":" in s:
+            m, sec = s.split(":")
+            return int(m) * 60 + float(sec)
+        return float(s)
+    except Exception:
+        return None
 
-@router.get("/results")
+_MEET_MAP = [
+    (r"^\d{4}\s*", ""), (r"^\d{3}\s*", ""), (r"^.*?年", ""),
+    ("臺中市114年市長盃水上運動競賽(游泳項目)", "台中市長盃"),
+    ("全國冬季短水道游泳錦標賽", "全國冬短"),
+    ("全國總統盃暨美津濃游泳錦標賽", "全國總統盃"),
+    ("全國總統盃暨美津濃分齡游泳錦標賽", "全國總統盃"),
+    ("冬季短水道", "冬短"),
+    ("全國運動會臺南市游泳代表隊選拔賽", "台南全運會選拔"),
+    ("全國青少年游泳錦標賽", "全國青少"),
+    ("臺中市議長盃", "台中議長盃"),
+    ("臺中市市長盃", "台中市長盃"),
+    ("(游泳項目)", ""),
+    ("春季游泳錦標賽", "春長"),
+    ("全國E世代青少年", "E世代"),
+    ("臺南市市長盃短水道", "台南市長盃"),
+    ("臺南市中小學", "台南中小學"),
+    ("臺南市委員盃", "台南委員盃"),
+    ("臺南市全國運動會游泳選拔賽", "台南全運會選拔"),
+    ("游泳錦標賽", ""),
+]
+
+def clean_meet_name(name: str) -> str:
+    if not name:
+        return name
+    out = name
+    for pat, repl in _MEET_MAP:
+        if pat.startswith("^") or pat.endswith("年"):
+            out = re.sub(pat, repl, out)
+        else:
+            out = out.replace(pat, repl)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+# ---------- routes ----------
+
+@router.get("/api/health")
+def health() -> Dict[str, str]:
+    return {"ok": "true"}
+
+@router.get("/api/results")
 def results(
-    name: str = Query(..., description="選手姓名（精確匹配）"),
-    stroke: str = Query("", description="項目（例：50公尺蛙式；可留空）"),
+    name: str = Query(..., description="選手姓名"),
+    stroke: str = Query(..., description="項目（例：50公尺蛙式）"),
     limit: int = Query(50, ge=1, le=500),
     cursor: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """
-    回傳欄位：
-    - 年份(8碼) 例 20250726
-    - 賽事名稱（原始 & 簡化）
-    - 項目（原始 & 正規化距離）
-    - 成績（字串）、seconds（數值）
-    - 名次、泳池長度、姓名
-    """
-    offset = int(cursor)
-    params = {"name": name, "limit": limit, "offset": offset}
-
     base_sql = """
         SELECT
-            "年份"::text AS year8,
-            "賽事名稱"::text AS meet,
-            "項目"::text AS item,
-            "成績"::text AS result,
-            COALESCE("名次"::text, '') AS rank,
-            COALESCE("泳池長度"::text, '') AS pool_len,
-            "姓名"::text AS swimmer
-        FROM swim_results
+            "年份"::text      AS year8,
+            "賽事名稱"::text   AS meet,
+            "項目"::text       AS item,
+            "成績"::text       AS result,
+            COALESCE("名次"::text, '')        AS rank,
+            COALESCE("泳池長度"::text, '')    AS pool_len,
+            "姓名"::text       AS swimmer
+        FROM public.swimming_scores
         WHERE "姓名" = :name
+          AND "項目" = :stroke
+        ORDER BY "年份" ASC
+        LIMIT :limit OFFSET :offset
     """
-    if stroke:
-        base_sql += ' AND "項目" = :stroke'
-        params["stroke"] = stroke
+    params = {"name": name, "stroke": stroke, "limit": limit, "offset": cursor}
+    rows = db.execute(text(base_sql), params).mappings().all()
 
-    # 以年份(8碼)排序（舊→新）；前端會再自行調整呈現順序
-    base_sql += ' ORDER BY "年份" ASC LIMIT :limit OFFSET :offset'
-
-    rows = db.execute(text(base_sql), params).fetchall()
-
-    items = []
+    items: List[Dict[str, Any]] = []
     for r in rows:
-        year8 = r.year8
-        meet = r.meet
-        item = r.item
-        seconds = convert_to_seconds(r.result)
+        sec = parse_seconds(r["result"])
         items.append(
             {
-                "年份": int(year8) if year8 and year8.isdigit() else year8,
-                "賽事名稱": meet,
-                "賽事簡稱": simplify_category(meet),
-                "項目": item,
-                "項目正規化": normalize_distance_item(item),
-                "成績": r.result,
-                "seconds": seconds,
-                "名次": r.rank,
-                "泳池長度": r.pool_len,
-                "姓名": r.swimmer,
+                "年份": r["year8"],
+                "賽事名稱": clean_meet_name(r["meet"] or ""),
+                "項目": r["item"],
+                "姓名": r["swimmer"],
+                "成績": r["result"],
+                "名次": r["rank"],
+                "泳池長度": r["pool_len"],
+                "seconds": sec,
             }
         )
 
-    next_cursor = offset + len(items)
-    return {"items": items, "nextCursor": (next_cursor if len(items) == limit else None)}
+    next_cursor = cursor + limit if len(rows) == limit else None
+    return {"items": items, "nextCursor": next_cursor}
 
-@router.get("/pb")
-def best_pb(
-    name: str,
-    stroke: str,
-    gender: str = "F",  # optional
+@router.get("/api/pb")
+def pb(
+    name: str = Query(...),
+    stroke: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """
-    取該選手某一「項目」PB
-    """
     sql = """
-        SELECT "成績"::text AS result, "賽事名稱"::text AS meet, "年份"::text AS year8
-        FROM swim_results
+        SELECT "年份"::text AS year8, "賽事名稱"::text AS meet, "成績"::text AS result
+        FROM public.swimming_scores
         WHERE "姓名" = :name AND "項目" = :stroke
         ORDER BY "年份" ASC
-        LIMIT 5000
+        LIMIT 2000
     """
-    rows = db.execute(text(sql), {"name": name, "stroke": stroke}).fetchall()
-    best = None
-    best_row = None
+    rows = db.execute(text(sql), {"name": name, "stroke": stroke}).mappings().all()
+
+    best = None  # (sec, year8, meet)
     for r in rows:
-        s = convert_to_seconds(r.result or "")
-        if s > 0 and (best is None or s < best):
-            best = s
-            best_row = r
-    if best is None:
-        raise HTTPException(404, "no result")
-    wa = calc_wa(best, stroke, gender)
+        sec = parse_seconds(r["result"])
+        if sec is None:
+            continue
+        if best is None or sec < best[0]:
+            best = (sec, r["year8"], clean_meet_name(r["meet"] or ""))
+
+    if not best:
+        return {"name": name, "stroke": stroke, "pb_seconds": None, "year": None, "from_meet": None}
+
     return {
         "name": name,
         "stroke": stroke,
-        "pb_seconds": round(best, 2),
-        "from_meet": best_row.meet,
-        "year": best_row.year8,
-        "wa": wa,
+        "pb_seconds": best[0],
+        "year": best[1],
+        "from_meet": best[2],
     }
