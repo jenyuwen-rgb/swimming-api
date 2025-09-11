@@ -1,31 +1,48 @@
+# main.py
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from app.routes import router
-import os
-from dotenv import load_dotenv
-
-# 載入環境變數
-load_dotenv()
-API_ORIGIN = os.getenv("API_ORIGIN", "")
+from starlette.middleware.cors import CORSMiddleware
+from app.routes import router  # 依你的實際匯入路徑
 
 app = FastAPI()
 
-# CORS 設定
+origins = [
+    "http://localhost:3000",
+    "https://swim-web.vercel.app",   # 例如 https://swim-web.vercel.app
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[API_ORIGIN] if API_ORIGIN else ["*"],
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 基本測試路由
-@app.get("/")
-def index():
-    return {"ok": True, "service": "swimming-record"}
-
-@app.get("/health")
+@app.get("/api/health")
 def health():
-    return {"status": "healthy"}
+    return {"ok": True}
 
-# 其他 API 路由
-app.include_router(router, prefix="/api")
+app.include_router(router)
+
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routes import router as api_router
+
+app = FastAPI(title="Swimming API", version="1.0.0")
+
+# CORS（前端在 Vercel，允許）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://swim-web.vercel.app"],  # 如需更嚴謹可改成你的網域 # 例如 https://swim-web.vercel.app
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 掛載 /api/*
+app.include_router(api_router, prefix="/api")
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "swimming-api"}
