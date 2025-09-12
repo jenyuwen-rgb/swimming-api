@@ -93,7 +93,7 @@ def results(
             "項目"::text       AS item,
             "成績"::text       AS result,
             COALESCE("名次"::text, '')        AS rank,
-            COALESCE("泳池長度"::text, '')    AS pool_len,
+            ''    AS pool_len,
             "姓名"::text       AS swimmer
         FROM swimming_scores
         WHERE "姓名" = :name
