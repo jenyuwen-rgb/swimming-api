@@ -1,3 +1,4 @@
+# app/routes.py
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -8,7 +9,8 @@ from .db import SessionLocal
 
 router = APIRouter()
 
-# ---------- DB Dependency ----------
+# ---------- helpers ----------
+
 def get_db():
     db = SessionLocal()
     try:
@@ -16,14 +18,14 @@ def get_db():
     finally:
         db.close()
 
-# ---------- Helpers ----------
 def parse_seconds(s: Optional[str]) -> Optional[float]:
     if not s:
         return None
     s = s.strip()
+    # formats: "00:37.81", "1:12.34", "37.28"
     try:
         if ":" in s:
-            m, sec = s.split(":", 1)
+            m, sec = s.split(":")
             return int(m) * 60 + float(sec)
         return float(s)
     except Exception:
@@ -61,7 +63,8 @@ def clean_meet_name(name: str) -> str:
             out = out.replace(pat, repl)
     return re.sub(r"\s{2,}", " ", out).strip()
 
-# ---------- Routes ----------
+# ---------- routes ----------
+
 @router.get("/health")
 def health() -> Dict[str, str]:
     return {"ok": "true"}
@@ -74,7 +77,6 @@ def results(
     cursor: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    # 注意：直接用 swimming_scores（不要加 schema 前綴）
     base_sql = """
         SELECT
             "年份"::text      AS year8,
