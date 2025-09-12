@@ -156,3 +156,13 @@ def pb(
         "year": best[1],
         "from_meet": best[2],
     }
+@router.get("/api/debug/strokes")
+def debug_strokes(name: str, db: Session = Depends(get_db)):
+    sql = """
+        SELECT DISTINCT "項目"::text AS item
+        FROM public.swimming_scores
+        WHERE "姓名" = :name
+        ORDER BY item
+    """
+    rows = db.execute(text(sql), {"name": name}).mappings().all()
+    return {"name": name, "strokes": [r["item"] for r in rows]}
