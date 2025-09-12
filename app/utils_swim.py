@@ -1,8 +1,8 @@
-# app/utils_swim.py
 import re
 from typing import Optional
 
 def convert_to_seconds(result: str) -> float:
+    """把 '1:33.50' 或 '93.5' 轉成秒數(float)。不合法回 0.0"""
     if not result:
         return 0.0
     s = result.strip()
@@ -49,10 +49,22 @@ def simplify_category(name: str) -> str:
             s = s.replace(k, v)
     for pat, repl in _MEET_REPLACEMENTS:
         s = pat.sub(repl, s)
-    return re.sub(r"\s{2,}", " ", s).strip()
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
 
 def normalize_distance_item(item: str) -> str:
     if not item:
         return ""
     m = re.search(r"(\d{2,3}公尺(?:自由式|蛙式|仰式|蝶式|混合式))", item)
     return m.group(1) if m else item
+
+WA_BASE = {"F": {}, "M": {}}
+
+def calc_wa(seconds: float, event: str, gender: str) -> Optional[int]:
+    if not seconds or seconds <= 0:
+        return None
+    base = WA_BASE.get(gender, {}).get(event)
+    if not base:
+        return None
+    pts = 1000.0 * (base / float(seconds)) ** 3
+    return int(round(pts))

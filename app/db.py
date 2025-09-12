@@ -1,21 +1,16 @@
-# app/db.py
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
-# Render/Supabase 建議強制 SSL
-if DATABASE_URL and "sslmode=" not in DATABASE_URL:
-    connector = "&" if "?" in DATABASE_URL else "?"
-    DATABASE_URL = f"{DATABASE_URL}{connector}sslmode=require"
-
+# Render / Supabase 建議：開啟 pre_ping、設定 recycle 避免閒置連線被砍
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_size=5,
-    max_overflow=5,
+    pool_recycle=300,
     future=True,
 )
 
