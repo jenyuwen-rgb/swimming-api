@@ -1,3 +1,4 @@
+# app/routes.py
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -6,7 +7,9 @@ import re
 
 from .db import SessionLocal
 
-router = APIRouter()  # 不要放 prefix
+router = APIRouter()
+
+# ---------- helpers ----------
 
 def get_db():
     db = SessionLocal()
@@ -59,26 +62,13 @@ def clean_meet_name(name: str) -> str:
             out = out.replace(pat, repl)
     return re.sub(r"\s{2,}", " ", out).strip()
 
-@router.get("/health")
+# ---------- routes ----------
+
+@router.get("/api/health")
 def health() -> Dict[str, str]:
     return {"ok": "true"}
 
-@router.get("/debug/ping")
-def debug_ping() -> Dict[str, str]:
-    return {"ping": "pong"}
-
-@router.get("/debug/columns")
-def debug_columns(db: Session = Depends(get_db)):
-    sql = """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'swimming_scores'
-        ORDER BY ordinal_position
-    """
-    cols = [r[0] for r in db.execute(text(sql)).all()]
-    return {"table": "swimming_scores", "columns": cols}
-
-@router.get("/results")
+@router.get("/api/results")
 def results(
     name: str = Query(..., description="選手姓名"),
     stroke: str = Query(..., description="項目（例：50公尺蛙式）"),
@@ -93,7 +83,7 @@ def results(
             "項目"::text       AS item,
             "成績"::text       AS result,
             COALESCE("名次"::text, '')        AS rank,
-            ''    AS pool_len,
+            ''                                 AS pool_len,
             "姓名"::text       AS swimmer
         FROM swimming_scores
         WHERE "姓名" = :name
@@ -123,7 +113,7 @@ def results(
     next_cursor = cursor + limit if len(rows) == limit else None
     return {"items": items, "nextCursor": next_cursor}
 
-@router.get("/pb")
+@router.get("/api/pb")
 def pb(
     name: str = Query(...),
     stroke: str = Query(...),
@@ -156,11 +146,13 @@ def pb(
         "year": best[1],
         "from_meet": best[2],
     }
+
+# --------- debug: 列出該選手所有可用項目 ----------
 @router.get("/api/debug/strokes")
 def debug_strokes(name: str, db: Session = Depends(get_db)):
     sql = """
         SELECT DISTINCT "項目"::text AS item
-        FROM public.swimming_scores
+        FROM swimming_scores
         WHERE "姓名" = :name
         ORDER BY item
     """
