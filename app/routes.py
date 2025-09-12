@@ -1,14 +1,12 @@
-# app/routes.py
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional
 import re
 
 from .db import SessionLocal
 
-router = APIRouter()
+router = APIRouter()  # 不要放 prefix
 
 def get_db():
     db = SessionLocal()
@@ -61,40 +59,26 @@ def clean_meet_name(name: str) -> str:
             out = out.replace(pat, repl)
     return re.sub(r"\s{2,}", " ", out).strip()
 
-@router.get("/api/health")
+@router.get("/health")
 def health() -> Dict[str, str]:
     return {"ok": "true"}
 
-# --- Debug endpoints ---
+@router.get("/debug/ping")
+def debug_ping() -> Dict[str, str]:
+    return {"ping": "pong"}
 
-@router.get("/api/debug/ping")
-def debug_ping(db: Session = Depends(get_db)):
-    try:
-        v = db.execute(text("SELECT 1 AS ok")).mappings().one()
-        return {"db_ok": v["ok"] == 1}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ping_failed: {type(e).__name__}: {e}")
-
-@router.get("/api/debug/columns")
+@router.get("/debug/columns")
 def debug_columns(db: Session = Depends(get_db)):
-    """
-    列出 swimming_scores 的欄位（實際存在為準）
-    """
     sql = """
-    SELECT column_name, data_type
-    FROM information_schema.columns
-    WHERE table_schema = current_schema() AND table_name = 'swimming_scores'
-    ORDER BY ordinal_position
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'swimming_scores'
+        ORDER BY ordinal_position
     """
-    try:
-        rows = db.execute(text(sql)).mappings().all()
-        return {"table": "swimming_scores", "columns": rows}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"columns_failed: {type(e).__name__}: {e}")
+    cols = [r[0] for r in db.execute(text(sql)).all()]
+    return {"table": "swimming_scores", "columns": cols}
 
-# --- Main endpoints ---
-
-@router.get("/api/results")
+@router.get("/results")
 def results(
     name: str = Query(..., description="選手姓名"),
     stroke: str = Query(..., description="項目（例：50公尺蛙式）"),
@@ -118,18 +102,11 @@ def results(
         LIMIT :limit OFFSET :offset
     """
     params = {"name": name, "stroke": stroke, "limit": limit, "offset": cursor}
-    try:
-        rows = db.execute(text(base_sql), params).mappings().all()
-    except ProgrammingError as e:
-        # 多半是表或欄位名不符
-        raise HTTPException(status_code=500, detail=f"sql_programming_error: {e.orig.pgcode} {e.orig.pgerror}")
-    except OperationalError as e:
-        raise HTTPException(status_code=500, detail=f"sql_operational_error: {e.orig}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"sql_error: {type(e).__name__}: {e}")
+    rows = db.execute(text(base_sql), params).mappings().all()
 
     items: List[Dict[str, Any]] = []
     for r in rows:
+        sec = parse_seconds(r["result"])
         items.append(
             {
                 "年份": r["year8"],
@@ -139,13 +116,14 @@ def results(
                 "成績": r["result"],
                 "名次": r["rank"],
                 "泳池長度": r["pool_len"],
-                "seconds": parse_seconds(r["result"]),
+                "seconds": sec,
             }
         )
+
     next_cursor = cursor + limit if len(rows) == limit else None
     return {"items": items, "nextCursor": next_cursor}
 
-@router.get("/api/pb")
+@router.get("/pb")
 def pb(
     name: str = Query(...),
     stroke: str = Query(...),
@@ -158,14 +136,7 @@ def pb(
         ORDER BY "年份" ASC
         LIMIT 2000
     """
-    try:
-        rows = db.execute(text(sql), {"name": name, "stroke": stroke}).mappings().all()
-    except ProgrammingError as e:
-        raise HTTPException(status_code=500, detail=f"sql_programming_error: {e.orig.pgcode} {e.orig.pgerror}")
-    except OperationalError as e:
-        raise HTTPException(status_code=500, detail=f"sql_operational_error: {e.orig}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"sql_error: {type(e).__name__}: {e}")
+    rows = db.execute(text(sql), {"name": name, "stroke": stroke}).mappings().all()
 
     best = None  # (sec, year8, meet)
     for r in rows:
