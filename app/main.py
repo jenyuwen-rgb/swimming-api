@@ -1,9 +1,11 @@
+# app/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routes import router as api_router
+from .routes import router
 
-app = FastAPI(title="swim-api", version="1.0.0")
+app = FastAPI(title="swim-api")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,9 +14,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 只在這裡掛一次 /api
-app.include_router(api_router, prefix="/api")
+# ✅ 統一由這裡加上 /api 前綴
+app.include_router(router, prefix="/api")
+
 
 @app.get("/")
 def root():
-    return {"message": "Swimming API. See /docs"}
+    return {"message": "swim-api OK"}
