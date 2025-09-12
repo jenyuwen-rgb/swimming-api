@@ -9,8 +9,7 @@ from .db import SessionLocal
 
 router = APIRouter()
 
-# ---------- helpers ----------
-
+# ---------- DB session ----------
 def get_db():
     db = SessionLocal()
     try:
@@ -18,11 +17,11 @@ def get_db():
     finally:
         db.close()
 
+# ---------- helpers ----------
 def parse_seconds(s: Optional[str]) -> Optional[float]:
     if not s:
         return None
     s = s.strip()
-    # formats: "00:37.81", "1:12.34", "37.28"
     try:
         if ":" in s:
             m, sec = s.split(":")
@@ -31,45 +30,51 @@ def parse_seconds(s: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
-_MEET_MAP = [
-    (r"^\d{4}\s*", ""), (r"^\d{3}\s*", ""), (r"^.*?年", ""),
-    ("臺中市114年市長盃水上運動競賽(游泳項目)", "台中市長盃"),
-    ("全國冬季短水道游泳錦標賽", "全國冬短"),
-    ("全國總統盃暨美津濃游泳錦標賽", "全國總統盃"),
-    ("全國總統盃暨美津濃分齡游泳錦標賽", "全國總統盃"),
-    ("冬季短水道", "冬短"),
-    ("全國運動會臺南市游泳代表隊選拔賽", "台南全運會選拔"),
-    ("全國青少年游泳錦標賽", "全國青少"),
-    ("臺中市議長盃", "台中議長盃"),
-    ("臺中市市長盃", "台中市長盃"),
-    ("(游泳項目)", ""),
-    ("春季游泳錦標賽", "春長"),
-    ("全國E世代青少年", "E世代"),
-    ("臺南市市長盃短水道", "台南市長盃"),
-    ("臺南市中小學", "台南中小學"),
-    ("臺南市委員盃", "台南委員盃"),
-    ("臺南市全國運動會游泳選拔賽", "台南全運會選拔"),
-    ("游泳錦標賽", ""),
+_MEET_REPLACEMENTS = [
+    (re.compile(r"^\d{4}\s*"), ""),
+    (re.compile(r"^\d{3}\s*"), ""),
+    (re.compile(r"^.*?年"), ""),
+    (re.compile(r"\(游泳項目\)"), ""),
 ]
+
+_MEET_MAP = {
+    "臺中市114年市長盃水上運動競賽(游泳項目)": "台中市長盃",
+    "全國冬季短水道游泳錦標賽": "全國冬短",
+    "全國總統盃暨美津濃游泳錦標賽": "全國總統盃",
+    "全國總統盃暨美津濃分齡游泳錦標賽": "全國總統盃",
+    "冬季短水道": "冬短",
+    "全國運動會臺南市游泳代表隊選拔賽": "台南全運會選拔",
+    "全國青少年游泳錦標賽": "全國青少",
+    "臺中市議長盃": "台中議長盃",
+    "臺中市市長盃": "台中市長盃",
+    "春季游泳錦標賽": "春長",
+    "全國E世代青少年": "E世代",
+    "臺南市市長盃短水道": "台南市長盃",
+    "臺南市中小學": "台南中小學",
+    "臺南市委員盃": "台南委員盃",
+    "臺南市全國運動會游泳選拔賽": "台南全運會選拔",
+    "游泳錦標賽": "",
+}
 
 def clean_meet_name(name: str) -> str:
     if not name:
-        return name
-    out = name
-    for pat, repl in _MEET_MAP:
-        if pat.startswith("^") or pat.endswith("年"):
-            out = re.sub(pat, repl, out)
-        else:
-            out = out.replace(pat, repl)
-    return re.sub(r"\s{2,}", " ", out).strip()
+        return ""
+    s = name.strip()
+    # 先明確對照替換
+    for k, v in _MEET_MAP.items():
+        if k in s:
+            s = s.replace(k, v)
+    # 再套一般規則
+    for pat, repl in _MEET_REPLACEMENTS:
+        s = pat.sub(repl, s)
+    return re.sub(r"\s{2,}", " ", s).strip()
 
 # ---------- routes ----------
-
-@router.get("/api/health")
+@router.get("/health")
 def health() -> Dict[str, str]:
     return {"ok": "true"}
 
-@router.get("/api/results")
+@router.get("/results")
 def results(
     name: str = Query(..., description="選手姓名"),
     stroke: str = Query(..., description="項目（例：50公尺蛙式）"),
@@ -77,16 +82,17 @@ def results(
     cursor: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
+    # 依你目前資料表名稱：swimming_scores
     base_sql = """
         SELECT
-            "年份"::text      AS year8,
-            "賽事名稱"::text   AS meet,
-            "項目"::text       AS item,
-            "成績"::text       AS result,
-            COALESCE("名次"::text, '')        AS rank,
-            COALESCE("泳池長度"::text, '')    AS pool_len,
-            "姓名"::text       AS swimmer
-        FROM public.swimming_scores
+            "年份"::text                AS year8,
+            "賽事名稱"::text             AS meet,
+            "項目"::text                 AS item,
+            "成績"::text                 AS result,
+            COALESCE("名次"::text, '')  AS rank,
+            COALESCE("泳池長度"::text, '') AS pool_len,
+            "姓名"::text                 AS swimmer
+        FROM swimming_scores
         WHERE "姓名" = :name
           AND "項目" = :stroke
         ORDER BY "年份" ASC
@@ -114,7 +120,7 @@ def results(
     next_cursor = cursor + limit if len(rows) == limit else None
     return {"items": items, "nextCursor": next_cursor}
 
-@router.get("/api/pb")
+@router.get("/pb")
 def pb(
     name: str = Query(...),
     stroke: str = Query(...),
@@ -122,7 +128,7 @@ def pb(
 ):
     sql = """
         SELECT "年份"::text AS year8, "賽事名稱"::text AS meet, "成績"::text AS result
-        FROM public.swimming_scores
+        FROM swimming_scores
         WHERE "姓名" = :name AND "項目" = :stroke
         ORDER BY "年份" ASC
         LIMIT 2000
