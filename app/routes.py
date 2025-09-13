@@ -279,7 +279,7 @@ def debug_name_detail(
     row = db.execute(text(sql), {"name": name}).mappings().first()
     return {"input": name, "info": (row or {})}
     
-    @router.get("/debug/rowcount")
+@router.get("/debug/rowcount")
 def debug_rowcount(db: Session = Depends(get_db)):
     sql = f'SELECT COUNT(*) FROM {TABLE}'
     n = db.execute(text(sql)).scalar() or 0
