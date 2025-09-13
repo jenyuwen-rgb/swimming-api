@@ -279,3 +279,28 @@ def debug_name_detail(
     row = db.execute(text(sql), {"name": name}).mappings().first()
     return {"input": name, "info": (row or {})}
     
+    @router.get("/debug/rowcount")
+def debug_rowcount(db: Session = Depends(get_db)):
+    sql = f'SELECT COUNT(*) FROM {TABLE}'
+    n = db.execute(text(sql)).scalar() or 0
+    return {"table": TABLE, "rows": int(n)}
+
+@router.get("/debug/names_sample")
+def debug_names_sample(db: Session = Depends(get_db)):
+    sql = f'''
+        SELECT DISTINCT "姓名"::text AS name
+        FROM {TABLE}
+        WHERE "姓名" IS NOT NULL AND LENGTH(TRIM("姓名"::text))>0
+        ORDER BY 1
+        LIMIT 50
+    '''
+    rows = db.execute(text(sql)).all()
+    return {"sample": [r[0] for r in rows]}
+
+@router.get("/debug/dbhint")
+def debug_dbhint():
+    # 只回一些不敏感片段，幫你確認連到哪個 DB
+    import os, re
+    url = os.getenv("DATABASE_URL", "")
+    masked = re.sub(r"://([^:]+):[^@]+@", r"://\\1:***@", url)
+    return {"DATABASE_URL_hint": masked}
