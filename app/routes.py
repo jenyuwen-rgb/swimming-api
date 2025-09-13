@@ -132,7 +132,8 @@ def results(
             items.append(
                 {
                     "年份": r["year8"],
-                    "賽事名稱": clean_meet_name(r["meet"]),
+                    "賽事名稱": clean_meet_name(r["meet"]),  # 仍保留簡化版，其他地方可用
+                    "賽事名稱_raw": r["meet"],               # ← 新增：原始名稱
                     "項目": r["item"],
                     "姓名": r["swimmer"],
                     "成績": r["result"],
