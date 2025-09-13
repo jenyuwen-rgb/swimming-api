@@ -561,3 +561,26 @@ def rank_api(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"rank failed: {e}")
+        
+@router.get("/debug/common_meets")
+def debug_common_meets(
+    name: str = Query(..., description="對手姓名"),
+    base: str = Query("温心妤", description="基準選手姓名"),
+    db: Session = Depends(get_db),
+):
+    sql = f"""
+        SELECT DISTINCT
+          a."年份"::text AS year,
+          a."賽事名稱"::text AS meet,
+          a."項目"::text AS item
+        FROM {TABLE} a
+        JOIN {TABLE} b
+          ON a."年份" = b."年份"
+         AND a."賽事名稱" = b."賽事名稱"
+         AND a."項目" = b."項目"
+        WHERE a."姓名" = :base
+          AND b."姓名" = :name
+        ORDER BY year, meet, item
+    """
+    rows = db.execute(text(sql), {"base": base, "name": name}).mappings().all()
+    return {"base": base, "name": name, "common": rows}
