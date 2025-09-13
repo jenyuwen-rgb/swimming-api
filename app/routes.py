@@ -425,116 +425,139 @@ def summary(
         "items": items,
         "nextCursor": next_cursor,
     }
-# app/routes.py（加在檔尾即可）
-from datetime import datetime, timedelta
-
-def _extract_style_and_dist(item: str):
-    s = str(item or "")
-    styles = ["蛙式", "仰式", "自由式", "蝶式", "混合式"]
-    style = next((k for k in styles if k in s), "")
-    m = re.search(r"(\d+)\s*公尺", s)
-    dist = f"{m.group(1)}公尺" if m else ""
-    return style, dist
-
 @router.get("/rank")
-def rank(
+def rank_api(
     name: str = Query(..., description="選手姓名"),
-    stroke: str = Query(..., description="同距離＋同泳式，例如 50公尺蛙式、100公尺自由式"),
-    months: int = Query(18, ge=1, le=120, description="近幾個月內的成績用來排名"),
+    stroke: str = Query(..., description="同距離＋同泳式（例如：50公尺蛙式）"),
     db: Session = Depends(get_db),
 ):
     """
-    規則：
-    1) 以「同距離＋同泳式」為 cohort（例如 50公尺蛙式）。
-    2) 只取近 months 個月資料（以 '年份' 的 yyyymmdd 比較）。
-    3) 每位選手取該 cohort 的 PB（可解析秒數者），再做由小到大排序。
-    4) 回傳：目標選手 PB、名次、總人數、百分位、前 10 名、本人上下各 3 名。
+    對手池：以「同年份＋同賽事名稱＋同項目」為準（你實際參加過的那些組別）
+    對手名單：從上述所有組別把參賽者（姓名）蒐集起來（含自己）
+    排名依據：各自在同 stroke（同距離＋同泳式）下的全期 PB（最小秒數）
+    回傳：名次、分母、百分位、榜首、以及鄰近名單
     """
-    # 解析查詢條件
-    want_style, want_dist = _extract_style_and_dist(stroke)
-    if not want_style or not want_dist:
-        raise HTTPException(status_code=400, detail="stroke 需包含距離與泳式，例如 50公尺蛙式")
+    try:
+        pat = f"%{stroke.strip()}%"
 
-    # 時間窗（以 yyyymmdd 數字比較）
-    today = datetime.utcnow().date()
-    since = today - timedelta(days=months * 30)
-    since_num = int(since.strftime("%Y%m%d"))
+        # 1) 你參加過的「同年份＋同賽事名稱＋同項目」清單（限定 stroke）
+        ev_sql = f"""
+            SELECT DISTINCT "年份"::text AS y, "賽事名稱"::text AS m, "項目"::text AS i
+            FROM {TABLE}
+            WHERE "姓名" = :name AND "項目" ILIKE :pat
+            LIMIT 5000
+        """
+        ev_rows = db.execute(text(ev_sql), {"name": name, "pat": pat}).mappings().all()
+        if not ev_rows:
+            return {
+                "name": name, "stroke": stroke,
+                "denominator": 0, "rank": None, "percentile": None,
+                "leader": None, "around": [], "opponents": []
+            }
 
-    # 撈同 cohort 的所有成績（只抓必要欄位）
-    sql = f"""
-        SELECT "姓名"::text AS swimmer,
-               "年份"::text AS year8,
-               "項目"::text AS item,
-               "成績"::text AS result
-        FROM {TABLE}
-        WHERE "項目" ILIKE :dist
-          AND "項目" ILIKE :style
-          AND "年份" >= :since
-        LIMIT 500000
-    """
-    rows = db.execute(
-        text(sql),
-        {"dist": f"%{want_dist}%", "style": f"%{want_style}%", "since": str(since_num)},
-    ).mappings().all()
+        # 2) 蒐集對手名單（含自己），條件 = 同年份＋同賽事名稱＋同項目
+        #    先做一個暫存表（用 tuple 進行多組 OR-條件）
+        combos = [(r["y"], r["m"], r["i"]) for r in ev_rows]
+        # 動態組 WHERE (y,m,i) IN ((...),(...))
+        tuple_sql_parts = []
+        params: Dict[str, Any] = {"name": name, "pat": pat}
+        for idx, (yy, mm, ii) in enumerate(combos):
+            params[f"y{idx}"] = yy
+            params[f"m{idx}"] = mm
+            params[f"i{idx}"] = ii
+            tuple_sql_parts.append(f"(:y{idx}, :m{idx}, :i{idx})")
 
-    # 各選手 PB
-    best_by_name: Dict[str, float] = {}
-    for r in rows:
-        sec = parse_seconds(r["result"])
-        if sec is None or sec <= 0:
-            continue
-        nm = r["swimmer"].strip()
-        if not nm:
-            continue
-        if nm not in best_by_name or sec < best_by_name[nm]:
-            best_by_name[nm] = sec
+        opp_sql = f"""
+            SELECT DISTINCT s."姓名"::text AS n
+            FROM {TABLE} s
+            WHERE (s."年份"::text, s."賽事名稱"::text, s."項目"::text) IN (
+                {", ".join(tuple_sql_parts)}
+            )
+            LIMIT 20000
+        """
+        opp_rows = db.execute(text(opp_sql), params).all()
+        names = [r[0] for r in opp_rows]
+        # 保險去重
+        names = sorted(set(names))
+        if not names:
+            return {
+                "name": name, "stroke": stroke,
+                "denominator": 0, "rank": None, "percentile": None,
+                "leader": None, "around": [], "opponents": []
+            }
 
-    # 若 cohort 為空
-    if not best_by_name:
+        # 3) 取出對手名單在「同 stroke」下的所有成績，計算各自 PB
+        #    用 IN (...) 動態參數
+        in_placeholders = ", ".join([f":n{idx}" for idx in range(len(names))])
+        score_params = {"pat": pat, **{f"n{idx}": n for idx, n in enumerate(names)}}
+        sc_sql = f"""
+            SELECT "姓名"::text AS n, "成績"::text AS r
+            FROM {TABLE}
+            WHERE "項目" ILIKE :pat
+              AND "姓名" IN ({in_placeholders})
+            LIMIT 500000
+        """
+        sc_rows = db.execute(text(sc_sql), score_params).mappings().all()
+
+        # 聚合 PB
+        best_by_name: Dict[str, float] = {}
+        for row in sc_rows:
+            sec = parse_seconds(row["r"])
+            if sec is None:
+                continue
+            n = row["n"]
+            if (n not in best_by_name) or (sec < best_by_name[n]):
+                best_by_name[n] = sec
+
+        # 4) 形成排行榜（只保留有 PB 的人）
+        board = [{"name": n, "pb_seconds": best_by_name[n]} for n in best_by_name.keys()]
+        if not board:
+            return {
+                "name": name, "stroke": stroke,
+                "denominator": 0, "rank": None, "percentile": None,
+                "leader": None, "around": [], "opponents": names
+            }
+
+        board.sort(key=lambda x: x["pb_seconds"])
+        denom = len(board)
+
+        # 找自己的 PB 與名次
+        you_idx = next((i for i, x in enumerate(board) if x["name"] == name), None)
+        you_rank = (you_idx + 1) if you_idx is not None else None
+        percentile = (100.0 * (denom - you_rank) / denom) if you_rank else None  # 越小越好，越接近 100% 表示越前面
+
+        # 榜首
+        leader = board[0]
+
+        # 鄰近（各取 3 名上下）
+        around = []
+        if you_idx is not None:
+            lo = max(0, you_idx - 3)
+            hi = min(denom, you_idx + 4)
+            for i in range(lo, hi):
+                if i == you_idx:
+                    continue
+                item = board[i].copy()
+                item["rank"] = i + 1
+                around.append(item)
+
+        # 最後附上你自己的資料
+        you = None
+        if you_idx is not None:
+            you = board[you_idx].copy()
+            you["rank"] = you_rank
+
         return {
+            "name": name,
             "stroke": stroke,
-            "months": months,
-            "total": 0,
-            "rank": None,
-            "percentile": None,
-            "pb_seconds": None,
-            "leaderboard": [],
-            "around": [],
+            "criteria": "同年份＋同賽事名稱＋同項目（依你實際參賽場次蒐集對手）",
+            "denominator": denom,
+            "rank": you_rank,
+            "percentile": percentile,
+            "leader": {"name": leader["name"], "pb_seconds": leader["pb_seconds"], "rank": 1},
+            "you": you,
+            "around": around,
+            "opponents": names,  # 原始對手名單（含無 PB 者）
         }
-
-    # 排序（小到大）
-    board = sorted(best_by_name.items(), key=lambda x: x[1])
-    names = [n for n, _ in board]
-
-    # 目標選手 PB 與名次（若目標沒有成績，也回傳名次 None）
-    me_pb = best_by_name.get(name)
-    me_rank = names.index(name) + 1 if name in names else None
-    total = len(board)
-    percentile = round(100.0 * (total - me_rank + 1) / total, 2) if me_rank else None
-
-    # 榜首前 10
-    leaderboard = [
-        {"rank": i + 1, "name": n, "pb_seconds": sec}
-        for i, (n, sec) in enumerate(board[:10])
-    ]
-
-    # 本人上下各 3 名
-    around = []
-    if me_rank:
-        i = me_rank - 1
-        lo = max(0, i - 3)
-        hi = min(total, i + 4)
-        for j in range(lo, hi):
-            n, s = board[j]
-            around.append({"rank": j + 1, "name": n, "pb_seconds": s})
-
-    return {
-        "stroke": stroke,
-        "months": months,
-        "total": total,
-        "rank": me_rank,
-        "percentile": percentile,  # 例如 92.5 表示打敗 92.5% 的人
-        "pb_seconds": me_pb,
-        "leaderboard": leaderboard,
-        "around": around,
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rank failed: {e}")
