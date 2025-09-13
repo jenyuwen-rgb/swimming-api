@@ -52,27 +52,26 @@ _MEET_MAP = [
     ("臺南市中小學", "台南中小學"),
     ("臺南市委員盃", "台南委員盃"),
     ("臺南市全國運動會游泳選拔賽", "台南全運會選拔"),
-    ("游泳錦標賽", ""),
 ]
+
 _MEET_REGEX = [
-    (re.compile(r"^\d{4}\s*"), ""),  # 開頭年份
-    (re.compile(r"^\d{3}\s*"), ""),  # 開頭三碼代號
+    (re.compile(r"^\d{4}\s*"), ""),   # 開頭年份
+    (re.compile(r"^\d{3}\s*"), ""),   # 開頭三碼代號
+    # 安全移除「游泳錦標賽」：不是接在「青少年」後面，或只在結尾才移除
+    (re.compile(r"(?<!青少年)游泳錦標賽"), ""),       # 不是「青少年」後面的情況
+    (re.compile(r"\s*游泳錦標賽\s*$"), ""),           # 或只在結尾
 ]
 
 def clean_meet_name(name: Optional[str]) -> str:
     if not name:
         return ""
     out = name.strip()
-    # 精準替換
-    for src, repl in _MEET_MAP:
+    for src, repl in _MEET_MAP:      # 先精準替換
         if src in out:
             out = out.replace(src, repl)
-    # 一般規則
-    for pat, repl in _MEET_REGEX:
+    for pat, repl in _MEET_REGEX:    # 再做一般規則
         out = pat.sub(repl, out)
-    # 連續空白清理
-    out = re.sub(r"\s{2,}", " ", out).strip()
-    return out
+    return re.sub(r"\s{2,}", " ", out).strip()
 
 # ---------- routes (由 main 掛上 /api 前綴；這裡不要 /api) ----------
 
@@ -204,3 +203,42 @@ def pb(
         }
     except Exception:
         return {"name": name, "stroke": stroke, "pb_seconds": None, "year": None, "from_meet": None}
+        
+        
+@router.get("/stats/family")
+def stats_family(
+    name: str = Query(..., description="選手姓名"),
+    db: Session = Depends(get_db),
+):
+    families = ["蛙式", "仰式", "自由式", "蝶式"]
+    out: Dict[str, Any] = {}
+
+    for fam in families:
+        pat = f"%{fam}%"
+        sql = f"""
+            SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+            FROM {TABLE}
+            WHERE "姓名" = :name AND "項目" ILIKE :pat
+            ORDER BY "年份" ASC
+            LIMIT 2000
+        """
+        rows = db.execute(text(sql), {"name": name, "pat": pat}).mappings().all()
+
+        count = 0
+        best = None  # (sec, y, m)
+        for r in rows:
+            sec = parse_seconds(r["r"])
+            if sec is None:
+                continue
+            count += 1
+            if best is None or sec < best[0]:
+                best = (sec, r["y"], clean_meet_name(r["m"]))
+
+        out[fam] = {
+            "count": count,
+            "pb_seconds": best[0] if best else None,
+            "year": best[1] if best else None,
+            "from_meet": best[2] if best else None,
+        }
+
+    return out
