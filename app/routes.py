@@ -111,8 +111,7 @@ def results(
                 "賽事名稱"::text   AS meet,
                 "項目"::text       AS item,
                 "成績"::text       AS result,
-                COALESCE("名次"::text, '')        AS rank,
-                COALESCE("泳池長度"::text, '')    AS pool_len,
+                COALESCE("名次"::text, '') AS rank,
                 "姓名"::text       AS swimmer
             FROM public.swimming_scores
             WHERE "姓名" = :name
@@ -128,26 +127,22 @@ def results(
         }
         rows = db.execute(text(base_sql), params).mappings().all()
 
-        items: List[Dict[str, Any]] = []
+        items = []
         for r in rows:
-            sec = parse_seconds(r["result"])
-            items.append(
-                {
-                    "年份": r["year8"],
-                    "賽事名稱": clean_meet_name(r["meet"] or ""),
-                    "項目": r["item"],
-                    "姓名": r["swimmer"],
-                    "成績": r["result"],
-                    "名次": r["rank"],
-                    "泳池長度": r["pool_len"],
-                    "seconds": sec,
-                }
-            )
+            items.append({
+                "年份": r["year8"],
+                "賽事名稱": clean_meet_name(r["meet"] or ""),
+                "項目": r["item"],
+                "姓名": r["swimmer"],
+                "成績": r["result"],
+                "名次": r["rank"],
+                "泳池長度": "",              # 這張表沒有此欄位，固定回空字串
+                "seconds": parse_seconds(r["result"]),
+            })
 
         next_cursor = cursor + limit if len(rows) == limit else None
         return {"items": items, "nextCursor": next_cursor}
-    except Exception as e:
-        logger.exception("results error: %s", e)
+    except Exception:
         raise HTTPException(status_code=500, detail="results failed")
 
 # 個人最佳（stroke 模糊比對）
