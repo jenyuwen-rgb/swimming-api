@@ -34,9 +34,8 @@ def parse_seconds(s: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
-# 先做明確替換，再做一般規則（年份/代碼移除）
+# 明確替換 + 一般規則（年份/代碼移除）
 _MEET_MAP = [
-    # 明確對照
     ("臺中市114年市長盃水上運動競賽(游泳項目)", "台中市長盃"),
     ("全國冬季短水道游泳錦標賽", "全國冬短"),
     ("全國總統盃暨美津濃游泳錦標賽", "全國總統盃"),
@@ -53,7 +52,6 @@ _MEET_MAP = [
     ("臺南市中小學", "台南中小學"),
     ("臺南市委員盃", "台南委員盃"),
     ("臺南市全國運動會游泳選拔賽", "台南全運會選拔"),
-    # 這個要放最後避免過度裁切
     ("游泳錦標賽", ""),
 ]
 _MEET_REGEX = [
@@ -65,7 +63,7 @@ def clean_meet_name(name: Optional[str]) -> str:
     if not name:
         return ""
     out = name.strip()
-    # 先精準替換
+    # 精準替換
     for src, repl in _MEET_MAP:
         if src in out:
             out = out.replace(src, repl)
@@ -137,10 +135,8 @@ def results(
             ORDER BY "年份" ASC
             LIMIT :limit OFFSET :offset
         """
-        rows = db.execute(
-            text(sql),
-            {"name": name, "pat": pat, "limit": limit, "offset": cursor},
-        ).mappings().all()
+        params = {"name": name, "pat": pat, "limit": limit, "offset": cursor}
+        rows = db.execute(text(sql), params).mappings().all()
 
         items: List[Dict[str, Any]] = []
         for r in rows:
@@ -159,9 +155,16 @@ def results(
             )
 
         next_cursor = cursor + limit if len(rows) == limit else None
-        return {"items": items, "nextCursor": next_cursor}
-    except Exception:
-        raise HTTPException(status_code=500, detail="results failed")
+
+        # Debug：回傳 SQL 與參數
+        return {
+            "debug_sql": sql,
+            "params": params,
+            "items": items,
+            "nextCursor": next_cursor,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"results failed: {e}")
 
 @router.get("/pb")
 def pb(
@@ -199,5 +202,4 @@ def pb(
             "from_meet": best[2],
         }
     except Exception:
-        # 為了保持穩定回應，不把 500 丟出去
         return {"name": name, "stroke": stroke, "pb_seconds": None, "year": None, "from_meet": None}
