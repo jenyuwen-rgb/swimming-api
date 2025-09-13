@@ -304,3 +304,110 @@ def debug_dbhint():
     url = os.getenv("DATABASE_URL", "")
     masked = re.sub(r"://([^:]+):[^@]+@", r"://\\1:***@", url)
     return {"DATABASE_URL_hint": masked}
+    
+@router.get("/summary")
+def summary(
+    name: str = Query(..., description="選手姓名"),
+    stroke: str = Query(..., description="指定泳姿＋距離，如：50公尺蛙式"),
+    limit: int = Query(200, ge=1, le=1000),
+    cursor: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    # 1) 取指定泳姿＋距離的明細（供「成績與專項分析」、「成績趨勢」、「詳細成績」）
+    pat = f"%{stroke.strip()}%"
+    sql = f"""
+        SELECT
+            "年份"::text      AS year8,
+            "賽事名稱"::text   AS meet,
+            "項目"::text       AS item,
+            "成績"::text       AS result,
+            COALESCE("名次"::text, '') AS rank,
+            COALESCE("水道"::text, '') AS lane,
+            "姓名"::text       AS swimmer
+        FROM {TABLE}
+        WHERE "姓名" = :name
+          AND "項目" ILIKE :pat
+        ORDER BY "年份" ASC
+        LIMIT :limit OFFSET :offset
+    """
+    params = {"name": name, "pat": pat, "limit": limit, "offset": cursor}
+    rows = db.execute(text(sql), params).mappings().all()
+    items = []
+    secs = []
+    for r in rows:
+        s = parse_seconds(r["result"])
+        if isinstance(s, (int, float)):
+            secs.append({"sec": s, "y": r["year8"]})
+        items.append({
+            "年份": r["year8"],
+            "賽事名稱": clean_meet_name(r["meet"]),
+            "項目": r["item"],
+            "姓名": r["swimmer"],
+            "成績": r["result"],
+            "名次": r["rank"],
+            "水道": r["lane"],
+            "泳池長度": "",
+            "seconds": s,
+        })
+    next_cursor = cursor + limit if len(rows) == limit else None
+
+    # 分析（出賽、平均、PB）
+    meet_count = len(items)
+    valid = [x["seconds"] for x in items if isinstance(x["seconds"], (int, float)) and x["seconds"] > 0]
+    avg_seconds = sum(valid)/len(valid) if valid else None
+    pb_seconds = min(valid) if valid else None
+
+    # 2) 四式專項統計（不分距離）
+    families = ["蛙式", "仰式", "自由式", "蝶式"]
+    fam_out = {}
+    for fam in families:
+        pf = f"%{fam}%"
+        q = f"""
+            SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r, "項目"::text AS item
+            FROM {TABLE}
+            WHERE "姓名" = :name AND "項目" ILIKE :pat
+            ORDER BY "年份" ASC
+            LIMIT 2000
+        """
+        rws = db.execute(text(q), {"name": name, "pat": pf}).mappings().all()
+        count = 0
+        dist_count = {}
+        best = None
+        for row in rws:
+            count += 1
+            mm = re.search(r"(\d+)\s*公尺", str(row["item"] or ""))
+            dist = f"{mm.group(1)}公尺" if mm else ""
+            if dist:
+                dist_count[dist] = dist_count.get(dist, 0) + 1
+            sec = parse_seconds(row["r"])
+            if sec is not None and (best is None or sec < best[0]):
+                best = (sec, row["y"], clean_meet_name(row["m"]))
+        mostDist, mostCount = "", 0
+        for d, c in dist_count.items():
+            if c > mostCount:
+                mostDist, mostCount = d, c
+        fam_out[fam] = {
+            "count": count,
+            "pb_seconds": best[0] if best else None,
+            "year": best[1] if best else None,
+            "from_meet": best[2] if best else None,
+            "mostDist": mostDist,
+            "mostCount": mostCount,
+        }
+
+    # 3) 趨勢點（給前端直接畫）
+    trend_points = [{"year": x["年份"], "seconds": x["seconds"]} for x in items if x["seconds"]]
+
+    return {
+        "analysis": {
+            "meetCount": meet_count,
+            "avg_seconds": avg_seconds,
+            "pb_seconds": pb_seconds,
+        },
+        "family": fam_out,
+        "trend": {
+            "points": trend_points,
+        },
+        "items": items,
+        "nextCursor": next_cursor,
+    }
