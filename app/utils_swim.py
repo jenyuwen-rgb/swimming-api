@@ -1,6 +1,17 @@
 import re
 from typing import Optional
 
+# --------- 共用小工具 ---------
+
+def make_stroke_pattern(stroke: str) -> str:
+    """
+    統一產生 SQL ILIKE 用的模糊比對 pattern。
+    例如傳入 "50蛙" → 回傳 "%50蛙%"
+    """
+    if not stroke:
+        return "%"
+    return f"%{stroke.strip()}%"
+
 def convert_to_seconds(result: str) -> float:
     """把 '1:33.50' 或 '93.5' 轉成秒數(float)。不合法回 0.0"""
     if not result:
@@ -15,9 +26,9 @@ def convert_to_seconds(result: str) -> float:
         return 0.0
 
 _MEET_REPLACEMENTS = [
-    (re.compile(r"^\d{4}\s*"), ""),
-    (re.compile(r"^\d{3}\s*"), ""),
-    (re.compile(r"^.*?年"), ""),
+    (re.compile(r"^\d{4}\s*"), ""),   # 開頭年份
+    (re.compile(r"^\d{3}\s*"), ""),   # 開頭三碼代號
+    (re.compile(r"^.*?年"), ""),      # 移除 xxx年 以前的字
     (re.compile(r"\(游泳項目\)"), ""),
 ]
 
@@ -41,23 +52,29 @@ _MEET_MAP = {
 }
 
 def simplify_category(name: str) -> str:
+    """賽事名稱簡化：先做對照，再做一般化規則處理"""
     if not name:
         return ""
     s = name.strip()
+
     for k, v in _MEET_MAP.items():
         if k in s:
             s = s.replace(k, v)
+
     for pat, repl in _MEET_REPLACEMENTS:
         s = pat.sub(repl, s)
+
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
 def normalize_distance_item(item: str) -> str:
+    """從 '11 & 12歲級女子組200公尺蛙式' 抽出 '200公尺蛙式'，失敗則回原字串"""
     if not item:
         return ""
     m = re.search(r"(\d{2,3}公尺(?:自由式|蛙式|仰式|蝶式|混合式))", item)
     return m.group(1) if m else item
 
+# （可選）WA 分數保留介面
 WA_BASE = {"F": {}, "M": {}}
 
 def calc_wa(seconds: float, event: str, gender: str) -> Optional[int]:
