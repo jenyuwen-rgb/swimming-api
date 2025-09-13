@@ -191,34 +191,41 @@ def stats_family(
     for fam in families:
         pat = f"%{fam}%"
         sql = f"""
-            SELECT "年份"::text AS y, "賽事名稱"::text AS m, "項目"::text AS item, "成績"::text AS r
+            SELECT
+              "年份"::text      AS y,
+              "賽事名稱"::text   AS m,
+              "成績"::text       AS r,
+              "項目"::text       AS item
             FROM {TABLE}
             WHERE "姓名" = :name AND "項目" ILIKE :pat
             ORDER BY "年份" ASC
-            LIMIT 5000
+            LIMIT 2000
         """
         rows = db.execute(text(sql), {"name": name, "pat": pat}).mappings().all()
 
         count = 0
-        best = None  # (sec, y, m)
         dist_count: Dict[str, int] = {}
+        best = None  # (sec, y, m)
 
-        for r in rows:
-            # 抓距離
-            dist = ""
-            m = re.search(r"(\d+)\s*公尺", r["item"] or "")
-            if m:
-                dist = f"{m.group(1)}公尺"
+        for row in rows:
+            # 1) 出賽數：不看成績格式，直接累加
+            count += 1
+
+            # 2) 距離：從「項目」抓出 (\d+)公尺
+            raw_item = str(row["item"] or "")
+            m = re.search(r"(\d+)\s*公尺", raw_item)
+            dist = f"{m.group(1)}公尺" if m else ""
+            if dist:
                 dist_count[dist] = dist_count.get(dist, 0) + 1
 
-            sec = parse_seconds(r["r"])
+            # 3) PB：只有成績可解析時才參與
+            sec = parse_seconds(row["r"])
             if sec is None:
                 continue
-            count += 1
             if best is None or sec < best[0]:
-                best = (sec, r["y"], clean_meet_name(r["m"]))
+                best = (sec, row["y"], clean_meet_name(row["m"]))
 
-        # 最多距離
+        # 算最多距離
         mostDist, mostCount = "", 0
         for d, c in dist_count.items():
             if c > mostCount:
@@ -232,4 +239,5 @@ def stats_family(
             "mostDist": mostDist,
             "mostCount": mostCount,
         }
+
     return out
