@@ -590,7 +590,7 @@ def debug_opponents(
     stroke: str = Query(..., description="指定項目（例如 50公尺蛙式）"),
     db: Session = Depends(get_db),
 ):
-    # 先找所有與 base 在同項目的對手清單
+    # 找所有與 base 在同項目的對手
     sql = f"""
         SELECT DISTINCT b."姓名"::text AS opponent,
                         a."年份"::text AS year,
@@ -626,7 +626,8 @@ def debug_opponents(
         best = None
         for r in rows_pb:
             sec = parse_seconds(r["result"])
-            if sec is None: continue
+            if sec is None:
+                continue
             if best is None or sec < best[0]:
                 best = (sec, r["year"], clean_meet_name(r["meet"]))
         if best:
@@ -634,4 +635,7 @@ def debug_opponents(
             opp["pb_year"] = best[1]
             opp["pb_meet"] = best[2]
 
-    return {"base": base, "stroke": stroke, "opponents": list(opponents.values())}
+    # 依 PB 排序，沒有 PB 的排最後
+    sorted_opps = sorted(opponents.values(), key=lambda x: (x["pb"] is None, x["pb"]))
+
+    return {"base": base, "stroke": stroke, "opponents": sorted_opps}
