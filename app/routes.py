@@ -584,3 +584,54 @@ def debug_common_meets(
     """
     rows = db.execute(text(sql), {"base": base, "name": name}).mappings().all()
     return {"base": base, "name": name, "common": rows}
+@router.get("/debug/opponents")
+def debug_opponents(
+    base: str = Query("温心妤", description="基準選手"),
+    stroke: str = Query(..., description="指定項目（例如 50公尺蛙式）"),
+    db: Session = Depends(get_db),
+):
+    # 先找所有與 base 在同項目的對手清單
+    sql = f"""
+        SELECT DISTINCT b."姓名"::text AS opponent,
+                        a."年份"::text AS year,
+                        a."賽事名稱"::text AS meet,
+                        a."項目"::text AS item
+        FROM {TABLE} a
+        JOIN {TABLE} b
+          ON a."年份" = b."年份"
+         AND a."賽事名稱" = b."賽事名稱"
+         AND a."項目" = b."項目"
+        WHERE a."姓名" = :base
+          AND a."項目" ILIKE :pat
+          AND b."姓名" <> :base
+        ORDER BY b."姓名", a."年份"
+    """
+    rows = db.execute(text(sql), {"base": base, "pat": f"%{stroke}%"}).mappings().all()
+
+    opponents = {}
+    for r in rows:
+        opp = r["opponent"]
+        if opp not in opponents:
+            opponents[opp] = {"opponent": opp, "pb": None, "pb_year": None, "pb_meet": None, "meets": []}
+        opponents[opp]["meets"].append({"year": r["year"], "meet": r["meet"], "item": r["item"]})
+
+    # 幫每個對手抓 PB
+    for opp in opponents.values():
+        sql_pb = f"""
+            SELECT "年份"::text AS year, "賽事名稱"::text AS meet, "成績"::text AS result
+            FROM {TABLE}
+            WHERE "姓名" = :name AND "項目" ILIKE :pat
+        """
+        rows_pb = db.execute(text(sql_pb), {"name": opp["opponent"], "pat": f"%{stroke}%"}).mappings().all()
+        best = None
+        for r in rows_pb:
+            sec = parse_seconds(r["result"])
+            if sec is None: continue
+            if best is None or sec < best[0]:
+                best = (sec, r["year"], clean_meet_name(r["meet"]))
+        if best:
+            opp["pb"] = best[0]
+            opp["pb_year"] = best[1]
+            opp["pb_meet"] = best[2]
+
+    return {"base": base, "stroke": stroke, "opponents": list(opponents.values())}
