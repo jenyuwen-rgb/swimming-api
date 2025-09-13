@@ -242,7 +242,9 @@ def stats_family(
 
     return out
     
-    @router.get("/debug/names")
+# ---------- debug helpers ----------
+
+@router.get("/debug/names")
 def debug_names(
     q: str = Query("", description="模糊查詢關鍵字（例如 心妤 / 溫 / 温）"),
     db: Session = Depends(get_db),
@@ -276,3 +278,4 @@ def debug_name_detail(
     """
     row = db.execute(text(sql), {"name": name}).mappings().first()
     return {"input": name, "info": (row or {})}
+    
