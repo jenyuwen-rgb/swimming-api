@@ -126,14 +126,14 @@ def results(
         params = {"name": name, "pat": pat, "limit": limit, "offset": cursor}
         rows = db.execute(text(sql), params).mappings().all()
 
+        # 先組 items（含 seconds），等等標記 PB
         items: List[Dict[str, Any]] = []
         for r in rows:
             sec = parse_seconds(r["result"])
             items.append(
                 {
                     "年份": r["year8"],
-                    "賽事名稱": clean_meet_name(r["meet"]),  # 仍保留簡化版，其他地方可用
-                    "賽事名稱_raw": r["meet"],               # ← 新增：原始名稱
+                    "賽事名稱": clean_meet_name(r["meet"]),
                     "項目": r["item"],
                     "姓名": r["swimmer"],
                     "成績": r["result"],
@@ -144,11 +144,24 @@ def results(
                 }
             )
 
+        # 找本頁結果中的 PB（>0 的最小秒數）
+        valid_secs = [x["seconds"] for x in items if isinstance(x["seconds"], (int, float)) and x["seconds"] > 0]
+        pb_seconds = min(valid_secs) if valid_secs else None
+
+        # 標記 is_pb
+        for x in items:
+            x["is_pb"] = (pb_seconds is not None and isinstance(x["seconds"], (int, float)) and x["seconds"] == pb_seconds)
+
         next_cursor = cursor + limit if len(rows) == limit else None
-        return {"debug_sql": sql, "params": params, "items": items, "nextCursor": next_cursor}
+        return {
+            "debug_sql": sql,
+            "params": params,
+            "pb_seconds": pb_seconds,
+            "items": items,
+            "nextCursor": next_cursor,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"results failed: {e}")
-
 @router.get("/pb")
 def pb(
     name: str = Query(..., description="選手姓名"),
