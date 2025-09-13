@@ -241,3 +241,38 @@ def stats_family(
         }
 
     return out
+    
+    @router.get("/debug/names")
+def debug_names(
+    q: str = Query("", description="模糊查詢關鍵字（例如 心妤 / 溫 / 温）"),
+    db: Session = Depends(get_db),
+):
+    pat = f"%{q.strip()}%" if q else "%"
+    sql = f"""
+        SELECT DISTINCT "姓名"::text AS name,
+               LENGTH("姓名"::text) AS len,
+               LENGTH(TRIM("姓名"::text)) AS trim_len
+        FROM {TABLE}
+        WHERE "姓名" ILIKE :pat
+        ORDER BY 1
+        LIMIT 200
+    """
+    rows = db.execute(text(sql), {"pat": pat}).mappings().all()
+    return {"q": q, "items": rows}
+
+@router.get("/debug/name_detail")
+def debug_name_detail(
+    name: str = Query(..., description="完整姓名，檢查是否有前後空白"),
+    db: Session = Depends(get_db),
+):
+    sql = f"""
+        SELECT
+          "姓名"::text AS name,
+          LENGTH("姓名"::text) AS len,
+          LENGTH(TRIM("姓名"::text)) AS trim_len
+        FROM {TABLE}
+        WHERE "姓名" = :name
+        LIMIT 1
+    """
+    row = db.execute(text(sql), {"name": name}).mappings().first()
+    return {"input": name, "info": (row or {})}
