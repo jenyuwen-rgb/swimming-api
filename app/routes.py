@@ -590,38 +590,58 @@ def debug_opponents(
     stroke: str = Query(..., description="指定項目（例如 50公尺蛙式）"),
     db: Session = Depends(get_db),
 ):
-    # 找所有與 base 在同項目的對手
-    sql = f"""
-        SELECT DISTINCT b."姓名"::text AS opponent,
-                        a."年份"::text AS year,
-                        a."賽事名稱"::text AS meet,
-                        a."項目"::text AS item
+    # 1) 依條件建立「對手池」
+    #    組別規則：
+    #      - 若 a."組別" 為純數字：不加組別限制（TRUE）
+    #      - 否則：b."組別" 必須與 a."組別" 全等（含 NULL）
+    sql_pool = f"""
+        SELECT DISTINCT
+            b."姓名"::text AS opponent,
+            a."年份"::text AS year,
+            a."賽事名稱"::text AS meet,
+            a."項目"::text AS item,
+            a."組別"::text AS grp
         FROM {TABLE} a
         JOIN {TABLE} b
           ON a."年份" = b."年份"
          AND a."賽事名稱" = b."賽事名稱"
          AND a."項目" = b."項目"
+         AND (
+               CASE
+                 WHEN COALESCE(a."組別",'') ~ '^[0-9]+$'
+                   THEN TRUE
+                 ELSE b."組別" IS NOT DISTINCT FROM a."組別"
+               END
+             )
         WHERE a."姓名" = :base
           AND a."項目" ILIKE :pat
           AND b."姓名" <> :base
         ORDER BY b."姓名", a."年份"
     """
-    rows = db.execute(text(sql), {"base": base, "pat": f"%{stroke}%"}).mappings().all()
+    rows = db.execute(text(sql_pool), {"base": base, "pat": f"%{stroke}%"}).mappings().all()
 
     opponents = {}
     for r in rows:
         opp = r["opponent"]
         if opp not in opponents:
-            opponents[opp] = {"opponent": opp, "pb": None, "pb_year": None, "pb_meet": None, "meets": []}
-        opponents[opp]["meets"].append({"year": r["year"], "meet": r["meet"], "item": r["item"]})
+            opponents[opp] = {
+                "opponent": opp,
+                "pb": None,
+                "pb_year": None,
+                "pb_meet": None,
+                "meets": []  # 曾與 base 同場同項目（且視規則可能同組別）的清單
+            }
+        opponents[opp]["meets"].append({
+            "year": r["year"], "meet": r["meet"], "item": r["item"], "group": r["grp"]
+        })
 
-    # 幫每個對手抓 PB
+    # 2) 幫每個對手抓該 stroke 的 PB
+    sql_pb = f"""
+        SELECT "年份"::text AS year, "賽事名稱"::text AS meet, "成績"::text AS result
+        FROM {TABLE}
+        WHERE "姓名" = :name AND "項目" ILIKE :pat
+    """
     for opp in opponents.values():
-        sql_pb = f"""
-            SELECT "年份"::text AS year, "賽事名稱"::text AS meet, "成績"::text AS result
-            FROM {TABLE}
-            WHERE "姓名" = :name AND "項目" ILIKE :pat
-        """
         rows_pb = db.execute(text(sql_pb), {"name": opp["opponent"], "pat": f"%{stroke}%"}).mappings().all()
         best = None
         for r in rows_pb:
@@ -635,7 +655,7 @@ def debug_opponents(
             opp["pb_year"] = best[1]
             opp["pb_meet"] = best[2]
 
-    # 依 PB 排序，沒有 PB 的排最後
+    # 3) 依 PB 排序（無 PB 放最後）
     sorted_opps = sorted(opponents.values(), key=lambda x: (x["pb"] is None, x["pb"]))
 
     return {"base": base, "stroke": stroke, "opponents": sorted_opps}
