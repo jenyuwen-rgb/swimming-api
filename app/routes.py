@@ -127,7 +127,7 @@ def results(
                 "項目"::text       AS item,
                 "成績"::text       AS result,
                 COALESCE("名次"::text, '')        AS rank,
-                COALESCE("泳池長度"::text, '')    AS pool_len,
+                COALESCE("水道"::text, '')    AS lane, 
                 "姓名"::text       AS swimmer
             FROM {TABLE}
             WHERE "姓名" = :name
@@ -149,7 +149,8 @@ def results(
                     "姓名": r["swimmer"],
                     "成績": r["result"],
                     "名次": r["rank"],
-                    "泳池長度": r["pool_len"],
+                    "水道": r["lane"],              # ← 改這裡
+                    "泳池長度": "",                 # ← 可選，相容前端
                     "seconds": sec,
                 }
             )
