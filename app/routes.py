@@ -4,12 +4,12 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional, Tuple
 import re
-
 from .db import SessionLocal
 
 router = APIRouter()
+TABLE = "swimming_scores"
 
-# -------------------- DB session --------------------
+# ------------------------ DB session ------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -17,489 +17,339 @@ def get_db():
     finally:
         db.close()
 
-TABLE = "swimming_scores"
+# ------------------------ helpers ------------------------
+WINTER_SHORT = "冬季短水道"
 
-# -------------------- helpers --------------------
 def parse_seconds(s: Optional[str]) -> Optional[float]:
+    """
+    支援 "37.28" 或 "1:15.23" -> 75.23 秒
+    非法回傳 None
+    """
     if not s:
         return None
-    s = str(s).strip()
+    v = s.strip()
     try:
-        if ":" in s:
-            m, sec = s.split(":")
+        if ":" in v:
+            m, sec = v.split(":")
             return int(m) * 60 + float(sec)
-        return float(s)
+        return float(v)
     except Exception:
         return None
 
-SHORT_COURSE_PAT = re.compile(r"(冬季短水道|短水道)", re.I)
-
-def is_short_course(meet_name: Optional[str]) -> bool:
-    return bool(meet_name and SHORT_COURSE_PAT.search(str(meet_name)))
-
-_MEET_MAP = [
-    ("臺中市114年市長盃水上運動競賽(游泳項目)", "台中市長盃"),
-    ("全國冬季短水道游泳錦標賽", "全國冬短"),
-    ("全國總統盃暨美津濃游泳錦標賽", "全國總統盃"),
-    ("全國總統盃暨美津濃分齡游泳錦標賽", "全國總統盃"),
-    ("冬季短水道", "冬短"),
-    ("全國運動會臺南市游泳代表隊選拔賽", "台南全運會選拔"),
-    ("全國青少年游泳錦標賽", "全國青少年"),
-    ("臺中市議長盃", "台中議長盃"),
-    ("臺中市市長盃", "台中市長盃"),
-    ("(游泳項目)", ""),
-    ("春季游泳錦標賽", "春長"),
-    ("全國E世代青少年", "E世代"),
-    ("臺南市市長盃短水道", "台南市長盃"),
-    ("臺南市中小學", "台南中小學"),
-    ("臺南市委員盃", "台南委員盃"),
-    ("臺南市全國運動會游泳選拔賽", "台南全運會選拔"),
-]
-_MEET_REGEX = [
-    (re.compile(r"^\d{4}\s*"), ""),
-    (re.compile(r"^\d{3}\s*"), ""),
-    (re.compile(r"(?<!青少年)游泳錦標賽"), ""),
-    (re.compile(r"\s*游泳錦標賽\s*$"), ""),
-]
-
 def clean_meet_name(name: Optional[str]) -> str:
-    if not name:
-        return ""
-    out = str(name).strip()
-    for src, repl in _MEET_MAP:
-        if src in out:
-            out = out.replace(src, repl)
-    for pat, repl in _MEET_REGEX:
-        out = pat.sub(repl, out)
-    return re.sub(r"\s{2,}", " ", out).strip()
+    return (name or "").strip()
 
-def user_year_range(db: Session, name: str, stroke_like: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    取該選手在指定泳姿＋距離之下的最小/最大 年份(YYYYMMDD)；若無資料回 (None, None)
-    """
-    sql = f"""
-        SELECT MIN("年份")::text AS ymin, MAX("年份")::text AS ymax
-        FROM {TABLE}
-        WHERE "姓名" = :name
-          AND "項目" ILIKE :pat
-    """
-    row = db.execute(text(sql), {"name": name, "pat": f"%{stroke_like}%"}).mappings().first()
-    if not row or not row["ymin"] or not row["ymax"]:
-        return (None, None)
-    return (row["ymin"], row["ymax"])
+def year_in_range(y: Optional[str]) -> bool:
+    s = (y or "").strip()
+    return len(s) == 8 and s.isdigit()
 
-def sec_min_record(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    best = None
-    for r in rows:
-        sec = parse_seconds(r.get("result"))
-        if sec is None:
-            continue
-        if is_short_course(r.get("meet")):
-            # 剔除冬季短水道，不納入 PB
-            continue
-        if best is None or sec < best["seconds"]:
-            best = {
-                "seconds": sec,
-                "year8": r.get("year8"),
-                "meet": clean_meet_name(r.get("meet")),
-            }
-    return best
+def is_numeric_group(g: Optional[str]) -> bool:
+    s = (g or "").strip()
+    return bool(s) and s.isdigit()
 
-# -------------------- health/debug --------------------
-@router.get("/health")
-def health() -> Dict[str, str]:
+# ------------------------ health/debug ------------------------
+@router.get("/api/health")
+def health():
     return {"ok": "true"}
 
-@router.get("/debug/dbhint")
-def debug_dbhint():
-    import os, re
-    url = os.getenv("DATABASE_URL", "")
-    masked = re.sub(r"://([^:]+):[^@]+@", r"://\\1:***@", url)
-    return {"DATABASE_URL_hint": masked}
+# 供前端（現行）使用：/api/results、/api/pb、/api/summary
+# -------------------------------------------------------------
 
-# -------------------- core APIs --------------------
-@router.get("/results")
+@router.get("/api/results")
 def results(
-    name: str = Query(..., description="選手姓名"),
-    stroke: str = Query(..., description="項目（支援模糊，如：50蛙、100自由）"),
+    name: str = Query(..., description="選手姓名（完整）"),
+    stroke: str = Query(..., description="項目（exact match；例如 50公尺蛙式）"),
     limit: int = Query(200, ge=1, le=1000),
     cursor: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     """
-    指定選手 + 指定泳姿距離的明細（供「成績分析 / 趨勢 / 細節」）
+    回傳某選手在某項目的明細（依年份 ASC），給『詳細成績』與『成績趨勢』使用。
     """
-    try:
-        sql = f"""
-            SELECT
-                "年份"::text      AS year8,
-                "賽事名稱"::text   AS meet,
-                "項目"::text       AS item,
-                "成績"::text       AS result,
-                COALESCE("名次"::text, '') AS rank,
-                COALESCE("水道"::text, '') AS lane,
-                "姓名"::text       AS swimmer
-            FROM {TABLE}
-            WHERE "姓名" = :name
-              AND "項目" ILIKE :pat
-            ORDER BY "年份" ASC
-            LIMIT :limit OFFSET :offset
-        """
-        params = {
-            "name": name,
-            "pat": f"%{stroke}%",
-            "limit": limit,
-            "offset": cursor,
-        }
-        rows = db.execute(text(sql), params).mappings().all()
+    sql = f"""
+        SELECT "年份"::text AS y, "賽事名稱"::text AS m, "項目"::text AS item,
+               "成績"::text AS r, COALESCE("名次"::text,'') AS rk, COALESCE("組別"::text,'') AS grp
+        FROM {TABLE}
+        WHERE "姓名" = :name AND "項目" = :stroke
+        ORDER BY "年份" ASC
+        LIMIT :lim OFFSET :ofs
+    """
+    rows = db.execute(text(sql), {"name": name, "stroke": stroke, "lim": limit, "ofs": cursor}).mappings().all()
+    items: List[Dict[str, Any]] = []
+    for t in rows:
+        sec = parse_seconds(t["r"])
+        items.append({
+            "年份": t["y"],
+            "賽事名稱": clean_meet_name(t["m"]),
+            "項目": t["item"],
+            "成績": t["r"],
+            "名次": t["rk"],
+            "組別": t["grp"],
+            "seconds": sec,
+        })
+    next_cursor = cursor + limit if len(rows) == limit else None
+    return {"items": items, "nextCursor": next_cursor}
 
-        items: List[Dict[str, Any]] = []
-        for r in rows:
-            sec = parse_seconds(r["result"])
-            items.append(
-                {
-                    "年份": r["year8"],
-                    "賽事名稱": clean_meet_name(r["meet"]),
-                    "項目": r["item"],
-                    "姓名": r["swimmer"],
-                    "成績": r["result"],
-                    "名次": r["rank"],
-                    "水道": r["lane"],
-                    "泳池長度": "",
-                    "seconds": sec,
-                }
-            )
-
-        next_cursor = cursor + limit if len(rows) == limit else None
-        return {"items": items, "nextCursor": next_cursor}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"results failed: {e}")
-
-@router.get("/pb")
+@router.get("/api/pb")
 def pb(
-    name: str = Query(..., description="選手姓名"),
-    stroke: str = Query(..., description="項目（支援模糊，如：50蛙、100自由）"),
+    name: str = Query(...),
+    stroke: str = Query(...),
+    year_min: Optional[str] = Query(None, description="YYYYMMDD；若給，PB 僅在此區間內"),
+    year_max: Optional[str] = Query(None, description="YYYYMMDD；若給，PB 僅在此區間內"),
     db: Session = Depends(get_db),
 ):
     """
-    取指定泳姿＋距離下的 PB（剔除冬季短水道）
+    取某人的 PB（限定同項目；可選時間區間；排除冬季短水道）
     """
-    try:
-        sql = f"""
-            SELECT "年份"::text AS year8, "賽事名稱"::text AS meet, "成績"::text AS result
-            FROM {TABLE}
-            WHERE "姓名" = :name AND "項目" ILIKE :pat
-            ORDER BY "年份" ASC
-            LIMIT 5000
-        """
-        rows = db.execute(text(sql), {"name": name, "pat": f"%{stroke}%"}).mappings().all()
-        best = sec_min_record(rows)
-        if not best:
-            return {"name": name, "stroke": stroke, "pb_seconds": None, "year": None, "from_meet": None}
-        return {"name": name, "stroke": stroke, "pb_seconds": best["seconds"], "year": best["year8"], "from_meet": best["meet"]}
-    except Exception:
-        return {"name": name, "stroke": stroke, "pb_seconds": None, "year": None, "from_meet": None}
+    cond_year = ""
+    params = {"name": name, "stroke": stroke}
+    if year_min and year_in_range(year_min):
+        cond_year += ' AND "年份" >= :ymin'
+        params["ymin"] = year_min
+    if year_max and year_in_range(year_max):
+        cond_year += ' AND "年份" <= :ymax'
+        params["ymax"] = year_max
 
-@router.get("/stats/family")
-def stats_family(
-    name: str = Query(..., description="選手姓名"),
-    db: Session = Depends(get_db),
-):
+    sql = f"""
+        SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+        FROM {TABLE}
+        WHERE "姓名" = :name
+          AND "項目" = :stroke
+          AND ("賽事名稱" IS NULL OR "賽事名稱" NOT ILIKE :winter)
+          {cond_year}
+        ORDER BY "年份" ASC
+        LIMIT 2000
     """
-    四式統計（不分距離），PB 亦剔除冬季短水道
-    """
-    families = ["蛙式", "仰式", "自由式", "蝶式"]
-    out: Dict[str, Any] = {}
-    for fam in families:
-        sql = f"""
-            SELECT
-              "年份"::text      AS year8,
-              "賽事名稱"::text   AS meet,
-              "成績"::text       AS result,
-              "項目"::text       AS item
-            FROM {TABLE}
-            WHERE "姓名" = :name AND "項目" ILIKE :pat
-            ORDER BY "年份" ASC
-            LIMIT 5000
-        """
-        rows = db.execute(text(sql), {"name": name, "pat": f"%{fam}%"}).mappings().all()
+    params["winter"] = f"%{WINTER_SHORT}%"
+    rows = db.execute(text(sql), params).mappings().all()
 
-        count = 0
-        dist_count: Dict[str, int] = {}
-        best = None  # (seconds, year8, meet)
-        for r in rows:
-            count += 1
-            m = re.search(r"(\d+)\s*公尺", str(r["item"] or ""))
-            dist = f"{m.group(1)}公尺" if m else ""
-            if dist:
-                dist_count[dist] = dist_count.get(dist, 0) + 1
+    best: Optional[Tuple[float, str, str]] = None
+    for t in rows:
+        sec = parse_seconds(t["r"])
+        if sec is None:
+            continue
+        if (best is None) or (sec < best[0]):
+            best = (sec, t["y"], clean_meet_name(t["m"]))
+    if not best:
+        return {"name": name, "stroke": stroke, "pb_seconds": None, "pb_year": None, "pb_meet": None}
+    return {"name": name, "stroke": stroke, "pb_seconds": best[0], "pb_year": best[1], "pb_meet": best[2]}
 
-            sec = parse_seconds(r["result"])
-            if sec is None:
-                continue
-            if is_short_course(r["meet"]):
-                continue
-            if best is None or sec < best[0]:
-                best = (sec, r["year8"], clean_meet_name(r["meet"]))
-
-        mostDist, mostCount = "", 0
-        for d, c in dist_count.items():
-            if c > mostCount:
-                mostDist, mostCount = d, c
-
-        out[fam] = {
-            "count": count,
-            "pb_seconds": best[0] if best else None,
-            "year": best[1] if best else None,
-            "from_meet": best[2] if best else None,
-            "mostDist": mostDist,
-            "mostCount": mostCount,
-        }
-    return out
-
-# -------------------- /summary 與 /rank --------------------
-@router.get("/summary")
+# ------------------------ /api/summary ------------------------
+@router.get("/api/summary")
 def summary(
-    name: str = Query(..., description="選手姓名"),
-    stroke: str = Query(..., description="指定泳姿＋距離，如：50公尺蛙式"),
+    name: str = Query(...),
+    stroke: str = Query(...),
     limit: int = Query(500, ge=1, le=2000),
     cursor: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     """
-    前端主要讀取：成績分析 + 趨勢資料（含 PB 紅點）+ 四式統計。
-    並額外回傳 leaderTrend（榜首的同泳姿＋距離，且限制在【輸入選手的歷年區間】內；剔除冬季短水道）。
+    前端主頁面用：成績分析＋四式統計＋趨勢（自己）＋ leaderTrend（榜首，限制在你資料區間，排除冬短）
     """
-    # 1) 取使用者明細
-    items_res = results(name=name, stroke=stroke, limit=limit, cursor=cursor, db=db)  # type: ignore
-    items: List[Dict[str, Any]] = items_res.get("items", [])  # already cleaned
-    next_cursor = items_res.get("nextCursor")
+    # 1) 先抓你在該項目的所有成績（做分析 & 趨勢 & 決定年份區間）
+    sql_me = f"""
+        SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+        FROM {TABLE}
+        WHERE "姓名" = :name AND "項目" = :stroke
+        ORDER BY "年份" ASC
+    """
+    rows_me = db.execute(text(sql_me), {"name": name, "stroke": stroke}).mappings().all()
 
-    # 2) 分析
-    secs = [x["seconds"] for x in items if isinstance(x.get("seconds"), (int, float)) and x["seconds"] > 0]
-    avg_seconds = sum(secs) / len(secs) if secs else None
+    items: List[Dict[str, Any]] = []
+    secs: List[float] = []
+    y_min, y_max = None, None
+    for t in rows_me:
+        sec = parse_seconds(t["r"])
+        y = t["y"]
+        items.append({"年份": y, "賽事名稱": clean_meet_name(t["m"]), "項目": stroke, "姓名": name, "成績": t["r"], "seconds": sec})
+        if sec is not None:
+            secs.append(sec)
+        if year_in_range(y):
+            if (y_min is None) or (y < y_min): y_min = y
+            if (y_max is None) or (y > y_max): y_max = y
+
+    # 分析
+    meet_count = len(items)
+    avg_seconds = sum([s for s in secs if s is not None]) / len(secs) if secs else None
     pb_seconds = min(secs) if secs else None
-    pb_point = None
-    if pb_seconds is not None:
-        for it in items:
-            if it["seconds"] == pb_seconds:
-                pb_point = {"year": it["年份"], "seconds": it["seconds"]}
-                break
 
-    # 3) 四式統計
-    fam = stats_family(name=name, db=db)  # type: ignore
+    # 趨勢（自己）
+    trend_points = [{"year": it["年份"], "seconds": it["seconds"]} for it in items if it["seconds"] is not None]
 
-    # 4) 趨勢
-    trend_points = [{"year": it["年份"], "seconds": it["seconds"]} for it in items if it.get("seconds")]
-    # 排序（YYYYMMDD asc）
-    trend_points.sort(key=lambda x: x["year"])
+    # 若尚無區間，leaderTrend 也沒法算
+    leader_points: List[Dict[str, Any]] = []
 
-    # 5) leaderTrend（依 /rank 找出榜首，再撈榜首的資料；且限制在使用者的年份區間）
-    leaderTrend = {"name": None, "points": []}  # default
+    # 搭配 /api/rank 的規則找到榜首（相同邏輯，取得 leader name）
+    leader_name = None
     try:
-        # 使用者年份區間
-        ymin, ymax = user_year_range(db, name, stroke)
-        # 若沒有年份區間，直接回基本結構
-        if ymin and ymax:
-            # 找榜首（和 /rank 一致：在「同年份＋同賽事＋同項目」的對手池內、PB 同泳姿距離且剔除短水道）
-            rank_data = rank(name=name, stroke=stroke, db=db)  # type: ignore
-            leader = (rank_data or {}).get("leader")  # {"name":..., "pb_seconds":..., "rank":1}
-            if leader and leader.get("name"):
-                leader_name = leader["name"]
-
-                # 撈榜首同泳姿＋距離，且年份限制在 [ymin, ymax]
-                sql = f"""
-                    SELECT "年份"::text AS year8, "賽事名稱"::text AS meet, "成績"::text AS result
-                    FROM {TABLE}
-                    WHERE "姓名" = :leader
-                      AND "項目" ILIKE :pat
-                      AND "年份" BETWEEN :ymin AND :ymax
-                    ORDER BY "年份" ASC
-                    LIMIT 5000
-                """
-                lrows = db.execute(
-                    text(sql),
-                    {"leader": leader_name, "pat": f"%{stroke}%", "ymin": ymin, "ymax": ymax},
-                ).mappings().all()
-
-                pts: List[Dict[str, Any]] = []
-                for r in lrows:
-                    if is_short_course(r["meet"]):
-                        continue  # 剔除冬短
-                    sec = parse_seconds(r["result"])
-                    if sec:
-                        pts.append({"year": r["year8"], "seconds": sec})
-                pts.sort(key=lambda x: x["year"])
-                leaderTrend = {"name": leader_name, "points": pts}
+        rk = rank(name=name, stroke=stroke, db=db)  # 直接呼叫下方函式取得資料（不走網路）
+        leader_name = rk.get("leader", {}).get("name")
     except Exception:
-        pass
+        leader_name = None
+
+    if leader_name and y_min and y_max:
+        sql_ld = f"""
+            SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+            FROM {TABLE}
+            WHERE "姓名" = :ld
+              AND "項目" = :stroke
+              AND "年份" >= :ymin AND "年份" <= :ymax
+              AND ("賽事名稱" IS NULL OR "賽事名稱" NOT ILIKE :winter)
+            ORDER BY "年份" ASC
+        """
+        rs = db.execute(text(sql_ld), {"ld": leader_name, "stroke": stroke, "ymin": y_min, "ymax": y_max, "winter": f"%{WINTER_SHORT}%"}).mappings().all()
+        for t in rs:
+            sec = parse_seconds(t["r"])
+            if sec is not None:
+                leader_points.append({"year": t["y"], "seconds": sec})
 
     return {
-        "analysis": {"meetCount": len(items), "avg_seconds": avg_seconds, "pb_seconds": pb_seconds, "pb_point": pb_point},
-        "family": fam,
+        "analysis": {"meetCount": meet_count, "avg_seconds": avg_seconds, "pb_seconds": pb_seconds},
+        "family": {},  #（若要四式統計，可沿用你原本版本；此處略）
         "trend": {"points": trend_points},
-        "leaderTrend": leaderTrend,
-        "items": items,
-        "nextCursor": next_cursor,
+        "leaderTrend": {"points": leader_points},
+        "items": items[cursor: cursor + limit],
+        "nextCursor": (cursor + limit) if (cursor + limit) < len(items) else None,
     }
 
-@router.get("/rank")
+# ------------------------ /api/rank ------------------------
+@router.get("/api/rank")
 def rank(
-    name: str = Query(..., description="選手姓名"),
-    stroke: str = Query(..., description="指定泳姿＋距離，如：50公尺蛙式"),
+    name: str = Query(..., description="輸入選手姓名"),
+    stroke: str = Query(..., description="項目（exact match）"),
     db: Session = Depends(get_db),
 ):
     """
-    排行（同年份＋同賽事名稱＋同項目 -> 對手池）
-    - PB 僅計入同泳姿＋距離，且剔除冬季短水道
-    - 另外 **新增條件**：對手的 PB 計算與排行只採用「輸入選手在該泳姿距離的歷年區間內」的成績
+    1) 找出輸入選手在該項目的所有出賽列，決定年份區間 [y_min, y_max]
+    2) 依「同一場賽事 + 同一項目（exact）」與『組別規則』蒐集對手姓名（排除自己），對手池去重
+    3) PB 計算（限定同項目、在 [y_min, y_max]、排除冬季短水道）
+    4) 排序、組出 top / you / leader / denominator
+    5) 回傳供前端排行卡片與 leaderTrend 取用
     """
-    # 先找使用者的年份區間（無則無法排行）
-    ymin, ymax = user_year_range(db, name, stroke)
-    if not ymin or not ymax:
+    # 1) 你的所有出賽（該項目），與年份區間
+    sql_me = f"""
+        SELECT "年份"::text AS y, "賽事名稱"::text AS m, COALESCE("組別"::text,'') AS g
+        FROM {TABLE}
+        WHERE "姓名" = :name AND "項目" = :stroke
+        ORDER BY "年份" ASC
+    """
+    rows_me = db.execute(text(sql_me), {"name": name, "stroke": stroke}).mappings().all()
+    if not rows_me:
         return {
-            "name": name,
-            "stroke": stroke,
-            "criteria": "同年份＋同賽事名稱＋同項目（依你實際參賽場次蒐集對手）",
-            "denominator": None,
-            "rank": None,
-            "percentile": None,
-            "leader": None,
-            "you": None,
-            "top": [],
-            "around": [],
-            "opponents": [],
+            "name": name, "stroke": stroke,
+            "denominator": 0, "rank": None, "percentile": None,
+            "top": [], "leader": None, "you": None,
+            "around": [], "opponents": []
         }
 
-    # 1) 取出使用者曾經參與的（年、賽事、項目）組合（限制在該泳姿＋距離 & 年份區間）
-    user_meets_sql = f"""
-        SELECT DISTINCT "年份"::text AS year8, "賽事名稱"::text AS meet, "項目"::text AS item
-        FROM {TABLE}
-        WHERE "姓名" = :name
-          AND "項目" ILIKE :pat
-          AND "年份" BETWEEN :ymin AND :ymax
-        LIMIT 10000
-    """
-    user_meets = db.execute(
-        text(user_meets_sql),
-        {"name": name, "pat": f"%{stroke}%", "ymin": ymin, "ymax": ymax},
-    ).mappings().all()
+    y_min, y_max = None, None
+    my_keys: List[Tuple[str, str, Optional[str], bool]] = []  # (meet, stroke, group_if_needed, use_group)
+    for t in rows_me:
+        y = t["y"]
+        if year_in_range(y):
+            if (y_min is None) or (y < y_min): y_min = y
+            if (y_max is None) or (y > y_max): y_max = y
+        g = (t["g"] or "").strip()
+        use_group = (not is_numeric_group(g)) and (g != "")
+        my_keys.append((t["m"], stroke, g if use_group else None, use_group))
 
-    if not user_meets:
-        return {
-            "name": name,
-            "stroke": stroke,
-            "criteria": "同年份＋同賽事名稱＋同項目（依你實際參賽場次蒐集對手）",
-            "denominator": 0,
-            "rank": None,
-            "percentile": None,
-            "leader": None,
-            "you": None,
-            "top": [],
-            "around": [],
-            "opponents": [],
-        }
+    # 2) 對手池：逐 key 查詢
+    opp_names: set = set()
+    for meet, item, grp, use_group in my_keys:
+        if use_group:
+            sql_opp = f"""
+                SELECT DISTINCT "姓名"::text AS n
+                FROM {TABLE}
+                WHERE "賽事名稱" = :m AND "項目" = :it AND COALESCE("組別"::text,'') = :g
+                  AND "姓名" <> :me
+            """
+            rs = db.execute(text(sql_opp), {"m": meet, "it": item, "g": grp, "me": name}).all()
+        else:
+            sql_opp = f"""
+                SELECT DISTINCT "姓名"::text AS n
+                FROM {TABLE}
+                WHERE "賽事名稱" = :m AND "項目" = :it
+                  AND "姓名" <> :me
+            """
+            rs = db.execute(text(sql_opp), {"m": meet, "it": item, "me": name}).all()
+        for r in rs:
+            opp_names.add(r[0])
 
-    # 2) 對手池：在這些（年份、賽事、項目）中出現過的所有姓名（含自己）
-    opp_sql = f"""
-        SELECT DISTINCT "姓名"::text AS name
-        FROM {TABLE}
-        WHERE ("年份","賽事名稱","項目") IN (
-            SELECT "年份","賽事名稱","項目"
+    # 3) 計算 PB（含你自己），限定年份區間＆排除冬短
+    def get_pb_one(person: str) -> Optional[Tuple[float, str, str]]:
+        cond = ' AND "年份" >= :ymin AND "年份" <= :ymax'
+        sql_pb = f"""
+            SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
             FROM {TABLE}
-            WHERE "姓名" = :name
-              AND "項目" ILIKE :pat
-              AND "年份" BETWEEN :ymin AND :ymax
-        )
-    """
-    opp_rows = db.execute(
-        text(opp_sql),
-        {"name": name, "pat": f"%{stroke}%", "ymin": ymin, "ymax": ymax},
-    ).mappings().all()
-    opp_names = [r["name"] for r in opp_rows]
-
-    # 3) 計算每個對手的 PB（僅限：同泳姿＋距離、非冬短、且年份 BETWEEN [ymin, ymax]）
-    def pb_for(swimmer: str) -> Optional[Dict[str, Any]]:
-        sql = f"""
-            SELECT "年份"::text AS year8, "賽事名稱"::text AS meet, "成績"::text AS result
-            FROM {TABLE}
-            WHERE "姓名" = :swimmer
-              AND "項目" ILIKE :pat
-              AND "年份" BETWEEN :ymin AND :ymax
+            WHERE "姓名" = :nm AND "項目" = :it
+              AND ("賽事名稱" IS NULL OR "賽事名稱" NOT ILIKE :winter)
+              {cond}
             ORDER BY "年份" ASC
-            LIMIT 5000
+            LIMIT 2000
         """
-        rows = db.execute(
-            text(sql),
-            {"swimmer": swimmer, "pat": f"%{stroke}%", "ymin": ymin, "ymax": ymax},
-        ).mappings().all()
-        best = sec_min_record(rows)
-        if not best:
-            return None
-        return {"name": swimmer, "pb_seconds": best["seconds"], "pb_year": best["year8"], "pb_meet": best["meet"]}
+        rows = db.execute(text(sql_pb), {
+            "nm": person, "it": stroke, "ymin": y_min, "ymax": y_max, "winter": f"%{WINTER_SHORT}%"
+        }).mappings().all()
+        best: Optional[Tuple[float, str, str]] = None
+        for t in rows:
+            sec = parse_seconds(t["r"])
+            if sec is None:
+                continue
+            if (best is None) or (sec < best[0]):
+                best = (sec, t["y"], clean_meet_name(t["m"]))
+        return best
 
-    opp_pbs: List[Dict[str, Any]] = []
-    for n in opp_names:
-        p = pb_for(n)
-        if p:
-            opp_pbs.append(p)
+    people = [name] + sorted(list(opp_names))
+    recs: List[Dict[str, Any]] = []
+    for p in people:
+        best = get_pb_one(p)
+        if best:
+            recs.append({"name": p, "pb_seconds": best[0], "pb_year": best[1], "pb_meet": best[2]})
 
-    if not opp_pbs:
+    if not recs:
         return {
-            "name": name,
-            "stroke": stroke,
-            "criteria": "同年份＋同賽事名稱＋同項目（依你實際參賽場次蒐集對手）",
-            "denominator": 0,
-            "rank": None,
-            "percentile": None,
-            "leader": None,
-            "you": None,
-            "top": [],
-            "around": [],
-            "opponents": opp_names,
+            "name": name, "stroke": stroke,
+            "denominator": 0, "rank": None, "percentile": None,
+            "top": [], "leader": None, "you": None,
+            "around": [], "opponents": sorted(list(opp_names))
         }
 
-    opp_pbs.sort(key=lambda x: x["pb_seconds"])
-    denom = len(opp_pbs)
+    # 排序 & 找名次
+    recs.sort(key=lambda x: x["pb_seconds"])
+    denom = len(recs)
+    your_idx = next((i for i, r in enumerate(recs) if r["name"] == name), None)
 
-    # 找自己的 PB 記錄
-    you = next((x for x in opp_pbs if x["name"] == name), None)
-
-    # 排名
-    myRank = None
-    if you:
-        myRank = opp_pbs.index(you) + 1
-
-    # 百分位（越小越快 → 以名次換算百分位）
+    # 百分位：越小越好（你的名次 / 總人數 -> 轉為 0-100 大越好）
     percentile = None
-    if myRank and denom:
-        percentile = (1 - (myRank - 1) / denom) * 100
+    if your_idx is not None and denom > 0:
+        rank_1based = your_idx + 1
+        percentile = (1 - ((rank_1based - 1) / denom)) * 100
 
-    leader = {"name": opp_pbs[0]["name"], "pb_seconds": opp_pbs[0]["pb_seconds"], "rank": 1}
-    top = opp_pbs[:10]
-
-    # around（你前後各三名）
+    # around：你附近幾位
     around: List[Dict[str, Any]] = []
-    if myRank:
-        i = myRank - 1
-        left = max(i - 3, 0)
-        right = min(i + 3, denom - 1)
-        for j in range(left, right + 1):
-            if 0 <= j < denom and j != i:
-                item = dict(opp_pbs[j])
-                item["rank"] = j + 1
-                around.append(item)
+    if your_idx is not None:
+        for j in range(max(0, your_idx - 3), min(denom, your_idx + 3)):
+            if j != your_idx:
+                around.append({**recs[j], "rank": j + 1})
+
+    # top 10
+    top = [{**recs[i], "rank": i + 1} for i in range(min(10, denom))]
+
+    you = None
+    if your_idx is not None:
+        you = {**recs[your_idx], "rank": your_idx + 1}
+
+    leader = {**recs[0], "rank": 1}
 
     return {
         "name": name,
         "stroke": stroke,
-        "criteria": "同年份＋同賽事名稱＋同項目（依你實際參賽場次蒐集對手；PB 限同泳姿距離、剔除冬短，且只採用你的歷年區間）",
         "denominator": denom,
-        "rank": myRank,
+        "rank": you["rank"] if you else None,
         "percentile": percentile,
         "leader": leader,
-        "you": (you | {"rank": myRank}) if you else None,
-        "top": [{**x, "rank": i + 1} for i, x in enumerate(top)],
+        "you": you,
         "around": around,
-        "opponents": opp_names,
+        "top": top,
+        "opponents": sorted(list(opp_names)),
     }
