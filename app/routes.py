@@ -364,6 +364,92 @@ def summary(
             "pb_seconds": pb_seconds,
         },
         "family": fam_out,
+        
+# ---- leaderTrend: 與 /rank 相同邏輯，找出對手池的榜首並回傳其完整歷史 ----
+leader_trend_points = []
+try:
+    # 取輸入選手於該泳姿＋距離的出賽清單（含組別）
+    q_meets = f"""
+        SELECT "年份"::text AS year8, "賽事名稱"::text AS meet, "項目"::text AS item, COALESCE("組別"::text, '') AS grp
+        FROM {TABLE}
+        WHERE "姓名" = :name AND "項目" ILIKE :pat
+        GROUP BY "年份","賽事名稱","項目","組別"
+        LIMIT 5000
+    """
+    base_meets = db.execute(text(q_meets), {"name": name, "pat": pat}).mappings().all()
+
+    opponents = {}
+    for m in base_meets:
+        year8 = m["year8"]; meet = m["meet"]; item = m["item"]; grp = m["grp"]
+        if same_numeric_group(grp):
+            q_opp = f"""
+                SELECT DISTINCT "姓名"::text AS nm
+                FROM {TABLE}
+                WHERE "年份" = :y AND "賽事名稱" = :m AND "項目" = :i
+                LIMIT 5000
+            """
+            rows = db.execute(text(q_opp), {"y": year8, "m": meet, "i": item}).mappings().all()
+        else:
+            q_opp = f"""
+                SELECT DISTINCT "姓名"::text AS nm
+                FROM {TABLE}
+                WHERE "年份" = :y AND "賽事名稱" = :m AND "項目" = :i AND COALESCE("組別"::text,'') = :g
+                LIMIT 5000
+            """
+            rows = db.execute(text(q_opp), {"y": year8, "m": meet, "i": item, "g": grp}).mappings().all()
+        for r in rows:
+            nm = r["nm"]
+            if nm and nm != name:
+                opponents[nm] = True
+
+    # 計算每位對手 PB（排除冬季短水道）
+    def best_of(player: str):
+        q = f"""
+            SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+            FROM {TABLE}
+            WHERE "姓名" = :player AND "項目" ILIKE :pat
+            ORDER BY "年份" ASC
+            LIMIT 5000
+        """
+        rows = db.execute(text(q), {"player": player, "pat": pat}).mappings().all()
+        best = None
+        for row in rows:
+            if is_winter_short_course(row["m"]):
+                continue
+            sec = parse_seconds(row["r"])
+            if sec is None or sec <= 0:
+                continue
+            if best is None or sec < best[0]:
+                best = (sec, row["y"], clean_meet_name(row["m"]))
+        return best
+
+    board = []
+    all_names = list(opponents.keys())
+    if name not in all_names:
+        all_names.append(name)
+    for nm in all_names:
+        b = best_of(nm)
+        if b:
+            board.append({"name": nm, "pb": b[0]})
+    board.sort(key=lambda x: x["pb"])
+    if board:
+        leader_name = board[0]["name"]
+        q_leader = f"""
+            SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+            FROM {TABLE}
+            WHERE "姓名" = :player AND "項目" ILIKE :pat
+            ORDER BY "年份" ASC
+            LIMIT 5000
+        """
+        for row in db.execute(text(q_leader), {"player": leader_name, "pat": pat}).mappings():
+            sec = parse_seconds(row["r"])
+            if sec is None or sec <= 0:
+                continue
+            leader_trend_points.append({"year": row["y"], "seconds": sec, "meet": row["m"]})
+except Exception:
+    leader_trend_points = []
+
+        "leaderTrend": {"points": leader_trend_points},
         "trend": {"points": trend_points},
         "items": items,
         "nextCursor": next_cursor,
