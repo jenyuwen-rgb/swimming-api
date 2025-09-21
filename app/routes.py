@@ -405,7 +405,9 @@ def summary(
             rows = db.execute(text(q), {"player": player, "pat": pat}).mappings().all()
             best = None
             for row in rows:
-                if is_winter_short_course(row["m"]):
+            if "t0" in locals() and t0 and (not row["y"] or not row["y"].isdigit() or int(row["y"]) < t0):
+                continue
+            if is_winter_short_course(row["m"]):
                     continue
                 sec = parse_seconds(row["r"])
                 if sec is None or sec <= 0:
@@ -421,8 +423,8 @@ def summary(
         for nm in all_names:
             b = best_of(nm)
             if b:
-                board.append({"name": nm, "pb": b[0]})
-        board.sort(key=lambda x: x["pb"])
+                board.append({"name": nm, "pb_seconds": b[0]})
+        board.sort(key=lambda x: x["pb_seconds"])
         if board:
             leader_name = board[0]["name"]
             q_leader = f"""
@@ -437,7 +439,10 @@ def summary(
                 if sec is None or sec <= 0:
                     continue
                 leader_trend_points.append({"year": row["y"], "seconds": sec, "meet": row["m"]})
-    except Exception:
+                # cutoff earlier than t0
+            if "t0" in locals() and t0:
+                leader_trend_points = [p for p in leader_trend_points if p.get("year") and str(p["year"]).isdigit() and int(p["year"]) >= t0]
+except Exception:
         leader_trend_points = []
 
     # ---- leaderTrend: 與 /rank 相同邏輯，找出對手池的榜首並回傳其完整歷史 ----
@@ -503,8 +508,8 @@ def summary(
         for nm in all_names:
             b = best_of(nm)
             if b:
-                board.append({"name": nm, "pb": b[0]})
-        board.sort(key=lambda x: x["pb"])
+                board.append({"name": nm, "pb_seconds": b[0]})
+        board.sort(key=lambda x: x["pb_seconds"])
         if board:
             leader_name = board[0]["name"]
             q_leader = f"""
@@ -585,8 +590,8 @@ def summary(
             for nm in all_names:
                 b = best_of(nm)
                 if b:
-                    board.append({"name": nm, "pb": b[0]})
-            board.sort(key=lambda x: x["pb"])
+                    board.append({"name": nm, "pb_seconds": b[0]})
+            board.sort(key=lambda x: x["pb_seconds"])
             if board:
                 leader_name = board[0]["name"]
                 q_leader = f"""
@@ -713,7 +718,7 @@ def rank_api(
     for nm in all_names:
         b = best_of(nm)
         if b:
-            board.append({"name": nm, "pb": b[0], "pb_year": b[1], "pb_meet": b[2]})
+            board.append({"name": nm, "pb_seconds": b[0], "pb_year": b[1], "pb_meet": b[2]})
 
     if not board:
         return {
@@ -723,7 +728,7 @@ def rank_api(
         }
 
     # 排序
-    board.sort(key=lambda x: x["pb"])
+    board.sort(key=lambda x: x["pb_seconds"])
     for i, row in enumerate(board, start=1):
         row["rank"] = i
 
@@ -765,7 +770,7 @@ def rank_api(
         "denominator": denominator,
         "rank": rank_no,
         "percentile": percentile,
-        "leader": {"name": leader["name"], "pb_seconds": leader["pb"], "rank": 1},
+        "leader": {"name": leader["name"], "pb_seconds": leader["pb_seconds"], "rank": 1},
         "you": {"name": name, "pb_seconds": you["pb"] if you else None,
                 "pb_year": you["pb_year"] if you else None,
                 "pb_meet": you["pb_meet"] if you else None,
