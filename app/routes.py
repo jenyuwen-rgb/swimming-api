@@ -152,12 +152,9 @@ def summary(
     cursor: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """
-    回傳：analysis（出賽、平均、PB）、trend（points: year, seconds）、items（倒序，含 is_pb）
-    """
     pat = f"%{stroke.strip()}%"
 
-    # 全量抓來算 analysis 與 PB（排除冬短）
+    # 全量資料（算 analysis 與 trend）
     sql_all = f"""
         SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
         FROM {TABLE}
@@ -167,27 +164,23 @@ def summary(
     """
     all_rows = db.execute(text(sql_all), {"name": name, "pat": pat}).mappings().all()
 
-    vals: List[float] = []
-    pb_sec = None
+    vals, pb_sec = [], None
     for r in all_rows:
         s = parse_seconds(r["r"])
         if s is not None and s > 0:
             vals.append(s)
-        if not is_winter_short_course(r["m"]) and s is not None and s > 0:
-            if pb_sec is None or s < pb_sec:
-                pb_sec = s
+            if not is_winter_short_course(r["m"]):
+                pb_sec = s if pb_sec is None or s < pb_sec else pb_sec
 
-    # trend 用全量（包含冬短，因為要看走勢）
     trend_points = [{"year": r["y"], "seconds": parse_seconds(r["r"])} for r in all_rows if parse_seconds(r["r"])]
 
-    # 分頁明細（倒序回傳；同時標 is_pb）
+    # 分頁明細（倒序，並標 is_pb）
     sql_page = f"""
-        SELECT
-            "年份"::text AS y, "賽事名稱"::text AS m, "項目"::text AS i,
-            "成績"::text AS r, "姓名"::text AS n,
-            COALESCE("名次"::text,'') AS rk,
-            COALESCE("水道"::text,'') AS ln,
-            COALESCE("組別"::text,'') AS g
+        SELECT "年份"::text AS y,"賽事名稱"::text AS m,"項目"::text AS i,
+               "成績"::text AS r,"姓名"::text AS n,
+               COALESCE("名次"::text,'') AS rk,
+               COALESCE("水道"::text,'') AS ln,
+               COALESCE("組別"::text,'') AS g
         FROM {TABLE}
         WHERE "姓名" = :name AND "項目" ILIKE :pat
         ORDER BY "年份" DESC
@@ -195,20 +188,13 @@ def summary(
     """
     page_rows = db.execute(text(sql_page), {"name": name, "pat": pat, "limit": limit, "offset": cursor}).mappings().all()
 
-    items: List[Dict[str, Any]] = []
+    items = []
     for r in page_rows:
         sec = parse_seconds(r["r"])
         items.append({
-            "年份": r["y"],
-            "賽事名稱": r["m"],
-            "項目": r["i"],
-            "姓名": r["n"],
-            "成績": r["r"],
-            "名次": r["rk"],
-            "水道": r["ln"],
-            "組別": r["g"],
-            "seconds": sec,
-            "is_pb": (sec is not None and pb_sec is not None and sec == pb_sec),
+            "年份": r["y"], "賽事名稱": r["m"], "項目": r["i"], "姓名": r["n"],
+            "成績": r["r"], "名次": r["rk"], "水道": r["ln"], "組別": r["g"],
+            "seconds": sec, "is_pb": (sec is not None and pb_sec is not None and sec == pb_sec),
         })
     next_cursor = cursor + limit if len(page_rows) == limit else None
 
@@ -217,8 +203,66 @@ def summary(
         "avg_seconds": (sum(vals) / len(vals)) if vals else None,
         "pb_seconds": pb_sec,
     }
-    return {"analysis": analysis, "trend": {"points": trend_points}, "items": items, "nextCursor": next_cursor}
 
+    # ---- 新增：四式專項統計（PB 依「該泳式最常參加的距離」計算） ----
+    family_out: Dict[str, Any] = {}
+    for fam in ["蛙式", "仰式", "自由式", "蝶式"]:
+        pf = f"%{fam}%"
+        q = f"""
+            SELECT "年份"::text AS y, "賽事名稱"::text AS m,
+                   "成績"::text AS r, "項目"::text AS i
+            FROM {TABLE}
+            WHERE "姓名" = :name AND "項目" ILIKE :pf
+            ORDER BY "年份" ASC
+            LIMIT 5000
+        """
+        rows = db.execute(text(q), {"name": name, "pf": pf}).mappings().all()
+
+        count = len(rows)
+        dist_count: Dict[str, int] = {}
+        best_by_dist: Dict[str, Tuple[float, str, str]] = {}  # dist -> (sec, year, meet)
+
+        for row in rows:
+            m = re.search(r"(\d+)\s*公尺", str(row["i"] or ""))
+            dist = f"{m.group(1)}公尺" if m else ""
+            if dist:
+                dist_count[dist] = dist_count.get(dist, 0) + 1
+
+            s = parse_seconds(row["r"])
+            if s is None or s <= 0 or is_winter_short_course(row["m"]):
+                continue
+            if dist:
+                cur = best_by_dist.get(dist)
+                if cur is None or s < cur[0]:
+                    best_by_dist[dist] = (s, row["y"], row["m"])
+
+        # 最多距離（並列時取字典序較小，如 100公尺 優先於 200公尺）
+        mostDist, mostCount = "", 0
+        for d, c in dist_count.items():
+            if c > mostCount or (c == mostCount and d < mostDist):
+                mostDist, mostCount = d, c
+
+        pb_tuple = best_by_dist.get(mostDist)
+        if pb_tuple is None and best_by_dist:
+            pb_tuple = min(best_by_dist.values(), key=lambda t: t[0])
+
+        family_out[fam] = {
+            "count": count,
+            "mostDist": mostDist,
+            "mostCount": mostCount,
+            "pb_seconds": pb_tuple[0] if pb_tuple else None,
+            "year": pb_tuple[1] if pb_tuple else None,
+            "from_meet": pb_tuple[2] if pb_tuple else None,
+        }
+    # ---- 新增結束 ----
+
+    return {
+        "analysis": analysis,
+        "trend": {"points": trend_points},
+        "items": items,
+        "nextCursor": next_cursor,
+        "family": family_out,   # 前端讀的就是這個
+    }
 # ----------------- /rank -----------------
 @router.get("/rank")
 def rank_api(
