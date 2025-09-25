@@ -7,9 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 def _ensure_sslmode(url: str) -> str:
-    """
-    若連線字串沒有帶 sslmode，幫你補上 ?sslmode=require
-    """
+    """若連線字串沒有帶 sslmode，補上 ?sslmode=require"""
     parsed = urlparse(url)
     q = dict(parse_qsl(parsed.query, keep_blank_values=True))
     if "sslmode" not in q:
@@ -27,25 +25,24 @@ DATABASE_URL = _ensure_sslmode(DATABASE_URL)
 p = urlparse(DATABASE_URL)
 is_pooler = ("pooler.supabase.com" in (p.hostname or "")) or (p.port == 6543)
 
-# 統一的 connect_args（確保 SSL）
 connect_args = {"sslmode": "require"}
 
 if is_pooler:
-    # 交由 PgBouncer 管理連線池：本地端禁用 SQLAlchemy 連線池
+    # 使用 PgBouncer：禁用 SQLAlchemy pool
     engine = create_engine(
         DATABASE_URL,
         poolclass=NullPool,
-        pool_pre_ping=True,     # 連線前 ping，避免死連線
+        pool_pre_ping=True,
         future=True,
         connect_args=connect_args,
     )
 else:
-    # 直連資料庫：開小池，避免免費方案/小實例被塞爆
+    # 直連資料庫：放寬池設定
     engine = create_engine(
         DATABASE_URL,
-        pool_size=2,
-        max_overflow=0,
-        pool_recycle=300,       # 避免閒置被砍後變成死連線
+        pool_size=5,        # 常駐連線數
+        max_overflow=5,     # 爆量時最多再開 5 條
+        pool_recycle=300,   # 避免閒置連線被砍
         pool_pre_ping=True,
         future=True,
         connect_args=connect_args,
