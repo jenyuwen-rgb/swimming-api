@@ -54,10 +54,11 @@ def results(
 ):
     """
     指定選手＋項目（泳姿＋距離）的明細，年份倒序（最新在前），並附上 is_pb 供前端標紅。
+    同步回傳『性別』『出生年』（若為 NULL 以空字串回傳）。
     """
     try:
         pat = f"%{stroke.strip()}%"
-        # 先抓全部（或分頁）資料：倒序
+        # 先抓分頁資料：倒序
         sql = f"""
             SELECT
                 "年份"::text AS y,
@@ -67,7 +68,9 @@ def results(
                 COALESCE("名次"::text,'')  AS rk,
                 COALESCE("水道"::text,'')  AS ln,
                 COALESCE("組別"::text,'')  AS g,
-                "姓名"::text AS n
+                "姓名"::text AS n,
+                COALESCE("性別"::text,'') AS gender,
+                COALESCE("出生年"::text,'') AS birth_year
             FROM {TABLE}
             WHERE "姓名" = :name AND "項目" ILIKE :pat
             ORDER BY "年份" DESC
@@ -102,6 +105,8 @@ def results(
                 "賽事名稱": r["m"],
                 "項目": r["i"],
                 "姓名": r["n"],
+                "性別": r["gender"],
+                "出生年": r["birth_year"],
                 "成績": r["r"],
                 "名次": r["rk"],
                 "水道": r["ln"],
@@ -174,25 +179,30 @@ def summary(
 
     trend_points = [{"year": r["y"], "seconds": parse_seconds(r["r"])} for r in all_rows if parse_seconds(r["r"])]
 
-    # 分頁明細（倒序，並標 is_pb）
+    # 分頁明細（倒序，並標 is_pb）＋ 性別/出生年
     sql_page = f"""
         SELECT "年份"::text AS y,"賽事名稱"::text AS m,"項目"::text AS i,
                "成績"::text AS r,"姓名"::text AS n,
                COALESCE("名次"::text,'') AS rk,
                COALESCE("水道"::text,'') AS ln,
-               COALESCE("組別"::text,'') AS g
+               COALESCE("組別"::text,'') AS g,
+               COALESCE("性別"::text,'') AS gender,
+               COALESCE("出生年"::text,'') AS birth_year
         FROM {TABLE}
         WHERE "姓名" = :name AND "項目" ILIKE :pat
         ORDER BY "年份" DESC
         LIMIT :limit OFFSET :offset
     """
-    page_rows = db.execute(text(sql_page), {"name": name, "pat": pat, "limit": limit, "offset": cursor}).mappings().all()
+    page_rows = db.execute(
+        text(sql_page), {"name": name, "pat": pat, "limit": limit, "offset": cursor}
+    ).mappings().all()
 
     items = []
     for r in page_rows:
         sec = parse_seconds(r["r"])
         items.append({
             "年份": r["y"], "賽事名稱": r["m"], "項目": r["i"], "姓名": r["n"],
+            "性別": r["gender"], "出生年": r["birth_year"],
             "成績": r["r"], "名次": r["rk"], "水道": r["ln"], "組別": r["g"],
             "seconds": sec, "is_pb": (sec is not None and pb_sec is not None and sec == pb_sec),
         })
@@ -204,7 +214,7 @@ def summary(
         "pb_seconds": pb_sec,
     }
 
-    # ---- 新增：四式專項統計（PB 依「該泳式最常參加的距離」計算） ----
+    # ---- 四式專項統計 ----
     family_out: Dict[str, Any] = {}
     for fam in ["蛙式", "仰式", "自由式", "蝶式"]:
         pf = f"%{fam}%"
@@ -236,7 +246,6 @@ def summary(
                 if cur is None or s < cur[0]:
                     best_by_dist[dist] = (s, row["y"], row["m"])
 
-        # 最多距離（並列時取字典序較小，如 100公尺 優先於 200公尺）
         mostDist, mostCount = "", 0
         for d, c in dist_count.items():
             if c > mostCount or (c == mostCount and d < mostDist):
@@ -254,15 +263,16 @@ def summary(
             "year": pb_tuple[1] if pb_tuple else None,
             "from_meet": pb_tuple[2] if pb_tuple else None,
         }
-    # ---- 新增結束 ----
+    # ---- 四式統計結束 ----
 
     return {
         "analysis": analysis,
         "trend": {"points": trend_points},
         "items": items,
         "nextCursor": next_cursor,
-        "family": family_out,   # 前端讀的就是這個
+        "family": family_out,
     }
+
 # ----------------- /rank -----------------
 @router.get("/rank")
 def rank_api(
@@ -272,17 +282,17 @@ def rank_api(
 ):
     """
     對手池規則：
-    - 必須與輸入選手「同年份＋同賽事＋同項目＋同組別」**至少兩次**才納入。
+    - 必須與輸入選手「同年份＋同賽事＋同項目＋同組別」至少兩次才納入。
     - PB 計算：同泳姿＋距離、排除冬短、且剔除早於輸入選手第一筆日期(t0)的成績。
     """
     pat = f"%{stroke.strip()}%"
 
-    # t0：輸入選手在該泳姿＋距離的第一筆日期（最早年份字串）
+    # t0
     t0_sql = f"""SELECT MIN("年份"::text) FROM {TABLE} WHERE "姓名"=:name AND "項目" ILIKE :pat"""
     t0 = db.execute(text(t0_sql), {"name": name, "pat": pat}).scalar()
     t0 = str(t0) if t0 else None
 
-    # 取輸入選手"同場"清單（y,m,i,g）
+    # 同場清單
     base_sql = f"""
         SELECT "年份"::text AS y, "賽事名稱"::text AS m, "項目"::text AS i, COALESCE("組別"::text,'') AS g
         FROM {TABLE}
@@ -292,7 +302,6 @@ def rank_api(
     """
     base = db.execute(text(base_sql), {"name": name, "pat": pat}).mappings().all()
 
-    # 統計每個對手與我「同場」的次數
     counters: Dict[str, int] = {}
     for b in base:
         q = f"""
@@ -306,15 +315,13 @@ def rank_api(
             nm = r[0]
             counters[nm] = counters.get(nm, 0) + 1
 
-    # 至少兩次同場才納入
     pool = [nm for nm, cnt in counters.items() if cnt >= 2]
     if name not in pool:
-        pool.append(name)  # 也把本人放進來
+        pool.append(name)
 
     if not pool:
         return {"denominator": 0, "rank": None, "percentile": None, "leader": None, "you": None, "top": [], "leaderTrend": []}
 
-    # 個人 PB（依規則）
     def best_of(player: str) -> Optional[Tuple[float, str, str]]:
         q = f"""
             SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
@@ -327,7 +334,7 @@ def rank_api(
         best = None
         for row in rows:
             if t0 and str(row["y"]) < t0:
-                continue  # 早於輸入選手第一筆，剔除
+                continue
             if is_winter_short_course(row["m"]):
                 continue
             s = parse_seconds(row["r"])
@@ -346,7 +353,6 @@ def rank_api(
     if not board:
         return {"denominator": 0, "rank": None, "percentile": None, "leader": None, "you": None, "top": [], "leaderTrend": []}
 
-    # 依 PB 排序
     board.sort(key=lambda x: x["pb_seconds"])
     for i, row in enumerate(board, start=1):
         row["rank"] = i
@@ -358,7 +364,6 @@ def rank_api(
     leader = board[0]
     top10 = board[:10]
 
-    # 榜首趨勢線（裁 t0）
     leader_trend: List[Dict[str, Any]] = []
     q_leader = f"""
         SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
