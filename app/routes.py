@@ -1,4 +1,3 @@
-# app/routes.py
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -53,12 +52,11 @@ def results(
     db: Session = Depends(get_db),
 ):
     """
-    指定選手＋項目（泳姿＋距離）的明細，年份倒序（最新在前），並附上 is_pb 供前端標紅。
+    指定選手＋項目（泳姿＋距離）的明細，年份倒序（最新在前），並附上 is_pb。
     同步回傳『性別』『出生年』（若為 NULL 以空字串回傳）。
     """
     try:
         pat = f"%{stroke.strip()}%"
-        # 先抓分頁資料：倒序
         sql = f"""
             SELECT
                 "年份"::text AS y,
@@ -78,7 +76,7 @@ def results(
         """
         rows = db.execute(text(sql), {"name": name, "pat": pat, "limit": limit, "offset": cursor}).mappings().all()
 
-        # 為了標 PB，需要計算整體 PB（排除冬短）
+        # PB（排冬短）
         sql_all = f"""
             SELECT "賽事名稱"::text AS m, "成績"::text AS r
             FROM {TABLE}
@@ -89,7 +87,7 @@ def results(
         all_rows = db.execute(text(sql_all), {"name": name, "pat": pat}).mappings().all()
         pb_sec = None
         for rr in all_rows:
-            if is_winter_short_course(rr["m"]): 
+            if is_winter_short_course(rr["m"]):
                 continue
             s = parse_seconds(rr["r"])
             if s is None or s <= 0:
@@ -122,7 +120,7 @@ def results(
 # ----------------- /pb -----------------
 @router.get("/pb")
 def pb(name: str = Query(...), stroke: str = Query(...), db: Session = Depends(get_db)):
-    """單純回傳該選手在該泳姿＋距離下（排除冬短）的 PB。"""
+    """回傳該選手在該泳姿＋距離下（排除冬短）的 PB。"""
     try:
         pat = f"%{stroke.strip()}%"
         sql = f"""
@@ -133,7 +131,7 @@ def pb(name: str = Query(...), stroke: str = Query(...), db: Session = Depends(g
             LIMIT 5000
         """
         rows = db.execute(text(sql), {"name": name, "pat": pat}).mappings().all()
-        best = None  # (sec, y, m)
+        best = None
         for r in rows:
             if is_winter_short_course(r["m"]):
                 continue
@@ -273,7 +271,29 @@ def summary(
         "family": family_out,
     }
 
-# ----------------- /rank -----------------
+# ----------------- /rank （新版） -----------------
+def _to_int_or_none(v: Optional[str]) -> Optional[int]:
+    try:
+        s = str(v).strip()
+        return int(s) if s and s.isdigit() else None
+    except Exception:
+        return None
+
+def _get_player_profile(db: Session, name: str) -> Tuple[Optional[str], Optional[int]]:
+    """回傳該選手最常見的 (性別, 出生年)"""
+    q = f"""
+        SELECT COALESCE("性別"::text,'') AS g, COALESCE("出生年"::text,'') AS by, COUNT(*) AS cnt
+        FROM {TABLE}
+        WHERE "姓名" = :name
+        GROUP BY g, by
+        ORDER BY cnt DESC
+        LIMIT 1
+    """
+    row = db.execute(text(q), {"name": name}).mappings().first()
+    if not row:
+        return None, None
+    return (row["g"] or None), _to_int_or_none(row["by"])
+
 @router.get("/rank")
 def rank_api(
     name: str = Query(...),
@@ -281,9 +301,12 @@ def rank_api(
     db: Session = Depends(get_db),
 ):
     """
-    對手池規則：
-    - 必須與輸入選手「同年份＋同賽事＋同項目＋同組別」至少兩次才納入。
-    - PB 計算：同泳姿＋距離、排除冬短、且剔除早於輸入選手第一筆日期(t0)的成績。
+    對手池規則（新版）：
+    - 同泳姿＋距離
+    - 與輸入選手同性別（若性別缺失則不套用）
+    - 出生年與輸入選手相差 ≤1（若出生年缺失則不套用）
+    - 取消「同場至少 2 次」限制
+    PB 規則維持：排冬短、且剔除早於 t0 的成績。
     """
     pat = f"%{stroke.strip()}%"
 
@@ -292,30 +315,27 @@ def rank_api(
     t0 = db.execute(text(t0_sql), {"name": name, "pat": pat}).scalar()
     t0 = str(t0) if t0 else None
 
-    # 同場清單
-    base_sql = f"""
-        SELECT "年份"::text AS y, "賽事名稱"::text AS m, "項目"::text AS i, COALESCE("組別"::text,'') AS g
+    me_gender, me_birth = _get_player_profile(db, name)
+
+    # 對手池
+    pool_sql = f"""
+        SELECT DISTINCT "姓名"::text AS nm
         FROM {TABLE}
-        WHERE "姓名"=:name AND "項目" ILIKE :pat
-        GROUP BY "年份","賽事名稱","項目","組別"
-        LIMIT 5000
+        WHERE "項目" ILIKE :pat
+          AND "姓名" <> :name
+          AND ( :g IS NULL OR COALESCE("性別"::text,'') = :g )
+          AND ( :by IS NULL OR
+                CASE
+                  WHEN "出生年" ~ '^\d+$' THEN ABS(("出生年")::int - :by) <= 1
+                  ELSE FALSE
+                END
+              )
+        LIMIT 20000
     """
-    base = db.execute(text(base_sql), {"name": name, "pat": pat}).mappings().all()
+    pool = [r[0] for r in db.execute(
+        text(pool_sql), {"pat": pat, "name": name, "g": me_gender, "by": me_birth}
+    ).all()]
 
-    counters: Dict[str, int] = {}
-    for b in base:
-        q = f"""
-            SELECT DISTINCT "姓名"::text AS nm
-            FROM {TABLE}
-            WHERE "年份"=:y AND "賽事名稱"=:m AND "項目"=:i AND COALESCE("組別"::text,'')=:g
-              AND "姓名"<>:name
-        """
-        rows = db.execute(text(q), {"y": b["y"], "m": b["m"], "i": b["i"], "g": b["g"], "name": name}).all()
-        for r in rows:
-            nm = r[0]
-            counters[nm] = counters.get(nm, 0) + 1
-
-    pool = [nm for nm, cnt in counters.items() if cnt >= 2]
     if name not in pool:
         pool.append(name)
 
@@ -364,6 +384,7 @@ def rank_api(
     leader = board[0]
     top10 = board[:10]
 
+    #  leader 趨勢（仍沿用 t0 與排冬短）
     leader_trend: List[Dict[str, Any]] = []
     q_leader = f"""
         SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
