@@ -2,21 +2,23 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import QueuePool
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+# Render 的 Environment 已經有 DATABASE_URL（含 sslmode=require）
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+# 允許用環境變數微調；不設就用預設值
+POOL_SIZE     = int(os.getenv("POOL_SIZE", "5"))   # 原本 2 太緊
+MAX_OVERFLOW  = int(os.getenv("MAX_OVERFLOW", "5"))
+POOL_TIMEOUT  = int(os.getenv("POOL_TIMEOUT", "15"))  # 等待池中連線最久(秒)
+POOL_RECYCLE  = int(os.getenv("POOL_RECYCLE", "300")) # 連線回收，避免閒置被砍
 
 engine = create_engine(
     DATABASE_URL,
-    poolclass=QueuePool,   # 明確使用 QueuePool
-    pool_size=2,          # 小一點，避免過多併發佔用連線池
-    max_overflow=0,       # 不溢出，穩定一點
-    pool_timeout=30,      # 等連線最多 30s
-    pool_recycle=300,     # 300s 回收，避免閒置被遠端關閉
-    pool_pre_ping=True,   # 取用前測試連線，壞的自動重連
-    connect_args={"sslmode": "require"},  # 強制 SSL（與 Supabase pooler 一致）
+    pool_size=POOL_SIZE,
+    max_overflow=MAX_OVERFLOW,
+    pool_timeout=POOL_TIMEOUT,
+    pool_recycle=POOL_RECYCLE,
+    pool_pre_ping=True,   # 斷線自動重連
     future=True,
 )
 
