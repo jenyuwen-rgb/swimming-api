@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional, Tuple
-import re
+import re, datetime
 from .db import SessionLocal
 
 router = APIRouter()
@@ -32,11 +32,83 @@ def parse_seconds(s: Optional[str]) -> Optional[float]:
         return None
 
 def is_winter_short_course(meet: str) -> bool:
-    """冬季短水道的成績不計入 PB"""
-    if not meet:
-        return False
+    """冬季短水道的成績不計入 PB / 快腿統計"""
+    if not meet: return False
     s = str(meet)
     return ("冬季短水道" in s) or ("短水道" in s and "冬" in s)
+
+def sex_norm(s: Optional[str]) -> Optional[str]:
+    if not s: return None
+    s = str(s)
+    if "女" in s: return "女"
+    if "男" in s: return "男"
+    return None
+
+# ---- WA Points ----
+# 公式： points = 1000 * (BaseTime / Time)^3
+# BaseTime 依「性別 × 泳程 × 池別」。
+# 這裡放常見泳程示例；你可擴充成完整表。
+WA_BASE_50 = {
+    # 長水道 50m pool
+    "男": {
+        "50自由式": 20.91, "100自由式": 46.86, "200自由式": 102.00,
+        "50蛙式": 25.95, "100蛙式": 56.88, "200蛙式": 126.12,
+        "50仰式": 24.00, "100仰式": 51.85, "200仰式": 112.53,
+        "50蝶式": 22.27, "100蝶式": 49.45, "200蝶式": 110.73,
+        "200混合式": 112.98, "400混合式": 246.00,
+    },
+    "女": {
+        "50自由式": 23.61, "100自由式": 51.71, "200自由式": 112.98,
+        "50蛙式": 29.16, "100蛙式": 64.13, "200蛙式": 139.11,
+        "50仰式": 26.98, "100仰式": 57.45, "200仰式": 124.12,
+        "50蝶式": 24.43, "100蝶式": 55.48, "200蝶式": 125.83,
+        "200混合式": 120.19, "400混合式": 255.00,
+    },
+}
+WA_BASE_25 = {
+    # 短水道 25m pool（示例）
+    "男": {
+        "50自由式": 20.16, "100自由式": 44.84, "200自由式": 98.07,
+        "50蛙式": 25.25, "100蛙式": 55.28, "200蛙式": 122.41,
+        "50仰式": 22.58, "100仰式": 49.28, "200仰式": 107.13,
+        "50蝶式": 21.75, "100蝶式": 48.08, "200蝶式": 108.20,
+        "200混合式": 110.34, "400混合式": 240.00,
+    },
+    "女": {
+        "50自由式": 23.19, "100自由式": 50.25, "200自由式": 109.34,
+        "50蛙式": 28.56, "100蛙式": 62.36, "200蛙式": 135.57,
+        "50仰式": 26.34, "100仰式": 56.06, "200仰式": 121.10,
+        "50蝶式": 24.05, "100蝶式": 54.03, "200蝶式": 122.50,
+        "200混合式": 117.60, "400混合式": 249.80,
+    },
+}
+
+def stroke_key_from_item(item: str) -> Optional[str]:
+    """
+    把「50公尺蛙式」「100公尺自由式」「200公尺混合式」轉成 WA key，如「50蛙式」「100自由式」「200混合式」。
+    若無法辨識回 None。
+    """
+    if not item: return None
+    s = re.sub(r"\s+", "", str(item))
+    m = re.search(r"(\d+)\s*公尺\s*(自由式|蛙式|仰式|蝶式|混合式)", s)
+    if not m: return None
+    dist = m.group(1)
+    style = m.group(2)
+    return f"{dist}{style}"
+
+def wa_points(gender: Optional[str], pool: int, item: str, seconds: Optional[float]) -> Optional[float]:
+    """根據性別＋池別（50/25）＋泳程，將秒數換算 WA points。缺資訊回 None。"""
+    g = sex_norm(gender)
+    if not g or not seconds or seconds <= 0: return None
+    key = stroke_key_from_item(item)
+    if not key: return None
+    base_map = WA_BASE_50 if int(pool) == 50 else WA_BASE_25
+    base = base_map.get(g, {}).get(key)
+    if not base: return None
+    try:
+        return 1000.0 * (float(base) / float(seconds)) ** 3
+    except Exception:
+        return None
 
 # ----------------- health -----------------
 @router.get("/health")
@@ -53,7 +125,7 @@ def results(
     db: Session = Depends(get_db),
 ):
     """
-    指定選手＋項目（泳姿＋距離）的明細，年份倒序（最新在前），並附上 is_pb 供前端標紅。
+    指定選手＋項目（泳姿＋距離）的明細，年份倒序（最新在前），並附上 is_pb。
     同步回傳『性別』『出生年』（若為 NULL 以空字串回傳）。
     """
     try:
@@ -153,6 +225,7 @@ def pb(name: str = Query(...), stroke: str = Query(...), db: Session = Depends(g
 def summary(
     name: str = Query(...),
     stroke: str = Query(...),
+    pool: int = Query(50, ge=25, le=50, description="WA points 池別：50=長水道，25=短水道"),
     limit: int = Query(500, ge=1, le=2000),
     cursor: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -197,6 +270,17 @@ def summary(
         text(sql_page), {"name": name, "pat": pat, "limit": limit, "offset": cursor}
     ).mappings().all()
 
+    # 性別（抓一筆有值的）
+    base_info_sql = f"""
+        SELECT NULLIF("性別"::text,'') AS gender
+        FROM {TABLE}
+        WHERE "姓名"=:name
+        ORDER BY "年份" DESC
+        LIMIT 1
+    """
+    g_row = db.execute(text(base_info_sql), {"name": name}).mappings().first()
+    gender = g_row["gender"] if g_row and g_row["gender"] else None
+
     items = []
     for r in page_rows:
         sec = parse_seconds(r["r"])
@@ -208,10 +292,14 @@ def summary(
         })
     next_cursor = cursor + limit if len(page_rows) == limit else None
 
+    # WA points（用本次查詢泳程的 PB 換算）
+    wa_pts = wa_points(gender, pool, stroke, pb_sec)
+
     analysis = {
         "meetCount": len(all_rows),
         "avg_seconds": (sum(vals) / len(vals)) if vals else None,
         "pb_seconds": pb_sec,
+        "wa_points": wa_pts,
     }
 
     # ---- 四式專項統計 ----
@@ -325,7 +413,6 @@ def rank_api(
         where_clauses.append('CAST(NULLIF("出生年"::text, \'\') AS INT) BETWEEN :by_min AND :by_max')
         params["by_min"] = byear - ageTol
         params["by_max"] = byear + ageTol
-    # 若 byear 為 None，則不加出生年條件（放寬）
 
     pool_sql = f"""
         SELECT DISTINCT "姓名"::text AS nm
@@ -411,3 +498,71 @@ def rank_api(
         "top": top10,
         "leaderTrend": leader_trend,
     }
+
+# ----------------- /groups （各分組：歷史最快＋近三年最快） -----------------
+@router.get("/groups")
+def groups_api(
+    name: str = Query(...),
+    stroke: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    回傳各分組 4 根柱：
+    - 'All-Time'：資料庫內該分組(以組別關鍵字匹配)＋同性別＋同泳程 的歷史最快（排除冬季短水道）
+    - This Year / Last-1 / Last-2：該年份該分組的最快（排除冬季短水道）
+    * 同『輸入選手性別』。
+    """
+    try:
+        # 找輸入選手性別
+        row = db.execute(text(f"""
+            SELECT NULLIF("性別"::text,'') AS g
+            FROM {TABLE} WHERE "姓名"=:n
+            ORDER BY "年份" DESC LIMIT 1
+        """), {"n": name}).mappings().first()
+        gender = row["g"] if row and row["g"] else None
+        if not gender:
+            return {"gender": None, "groups": []}
+
+        THIS = datetime.date.today().year
+        YEARS = [THIS, THIS-1, THIS-2]
+        GROUPS = ["18以上","高中","國中","國小高年級","國小中年級","國小低年級"]
+        pat = f"%{stroke.strip()}%"
+
+        def best_in_year(group_kw: str, y: Optional[int]) -> Optional[float]:
+            where = [
+                '"性別" = :g',
+                '"項目" ILIKE :pat',
+                '"組別" ILIKE :grp',
+                '("賽事名稱" NOT ILIKE \'%冬季短水道%\' AND NOT ("賽事名稱" ILIKE \'%短水道%\' AND "賽事名稱" ILIKE \'%冬%\'))',
+            ]
+            params = {"g": gender, "pat": pat, "grp": f"%{group_kw}%"}
+            if y is not None:
+                where.append('"年份"::text LIKE :y||\'%\'')
+                params["y"] = str(y)
+            sql = f"""
+                SELECT MIN(sec) FROM (
+                  SELECT CASE
+                    WHEN POSITION(':' IN "成績"::text)>0
+                    THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
+                    ELSE NULLIF("成績"::text,'')::float END AS sec,
+                    "賽事名稱"::text AS m
+                  FROM {TABLE}
+                  WHERE {" AND ".join(where)}
+                ) t
+                WHERE sec IS NOT NULL AND sec>0
+            """
+            v = db.execute(text(sql), params).scalar()
+            return float(v) if v else None
+
+        out = []
+        for g in GROUPS:
+            bars = []
+            all_time = best_in_year(g, None)
+            bars.append({"label": "All-Time", "seconds": all_time})
+            for y in YEARS:
+                bars.append({"label": str(y), "seconds": best_in_year(g, y)})
+            out.append({"group": g, "bars": bars})
+
+        return {"gender": gender, "groups": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"groups failed: {e}")
