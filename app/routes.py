@@ -278,11 +278,12 @@ def summary(
 def rank_api(
     name: str = Query(...),
     stroke: str = Query(...),
+    ageTol: int = Query(1, ge=0, le=5, description="年齡誤差；0=同年、1=±1"),
     db: Session = Depends(get_db),
 ):
     """
-    對手池規則（新版）：
-    - 同性別，且出生年 = 輸入選手出生年 ±1（若性別/出生年缺失則盡可能放寬；兩者皆缺則只回你自己）。
+    對手池規則：
+    - 同性別，且出生年 = 輸入選手出生年 ± ageTol（若性別/出生年缺失則盡可能放寬；兩者皆缺則只回你自己）。
     - 取消「同場至少 2 次」限制。
     - PB 計算：同泳姿＋距離、排除冬短、且剔除早於輸入選手第一筆日期(t0)的成績。
     """
@@ -311,19 +312,21 @@ def rank_api(
     t0 = db.execute(text(t0_sql), {"name": name, "pat": pat}).scalar()
     t0 = str(t0) if t0 else None
 
-    # 建立對手池（同泳姿＋距離，套性別/出生年 ±1）
+    # 建立對手池（同泳姿＋距離，套性別/出生年 ± ageTol）
     where_clauses = ['"項目" ILIKE :pat', '"姓名" <> :name']
     params: Dict[str, Any] = {"pat": pat, "name": name}
 
     if gender:
         where_clauses.append('COALESCE("性別"::text, \'\') = :gender')
         params["gender"] = gender
-    if byear is not None:
-        where_clauses.append('"出生年"::text IN (:by1, :by2)')
-        params["by1"] = str(byear - 1)
-        params["by2"] = str(byear + 1)
 
-    # 若兩者皆未知，對手池只會是自己（下面邏輯會處理）
+    if byear is not None:
+        # 僅納入能轉成整數的出生年，並做 between 篩選
+        where_clauses.append('CAST(NULLIF("出生年"::text, \'\') AS INT) BETWEEN :by_min AND :by_max')
+        params["by_min"] = byear - ageTol
+        params["by_max"] = byear + ageTol
+    # 若 byear 為 None，則不加出生年條件（放寬）
+
     pool_sql = f"""
         SELECT DISTINCT "姓名"::text AS nm
         FROM {TABLE}
