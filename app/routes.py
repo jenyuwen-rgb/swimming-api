@@ -500,6 +500,7 @@ def rank_api(
     }
 
 # ----------------- /groups （各分組：歷史最快＋近三年最快） -----------------
+# ----------------- /groups （各分組：歷史最快＋近三年最快） -----------------
 @router.get("/groups")
 def groups_api(
     name: str = Query(...),
@@ -508,12 +509,12 @@ def groups_api(
 ):
     """
     回傳各分組 4 根柱：
-    - 'All-Time'：資料庫內該分組(以組別關鍵字匹配)＋同性別＋同泳程 的歷史最快（排除冬季短水道）
+    - 'All-Time'：資料庫內該分組(關鍵字可在【組別】或【項目】欄)＋同性別＋同泳程 的歷史最快（排除冬季短水道）
     - This Year / Last-1 / Last-2：該年份該分組的最快（排除冬季短水道）
     * 同『輸入選手性別』。
     """
     try:
-        # 找輸入選手性別
+        # 先找輸入選手性別
         row = db.execute(text(f"""
             SELECT NULLIF("性別"::text,'') AS g
             FROM {TABLE} WHERE "姓名"=:n
@@ -525,27 +526,47 @@ def groups_api(
 
         THIS = datetime.date.today().year
         YEARS = [THIS, THIS-1, THIS-2]
-        GROUPS = ["18以上","高中","國中","國小高年級","國小中年級","國小低年級"]
         pat = f"%{stroke.strip()}%"
 
-        def best_in_year(group_kw: str, y: Optional[int]) -> Optional[float]:
+        # 分組→關鍵字別名（你可視資料再擴充）
+        GROUP_ALIASES = {
+            "18以上": ["18以上", "18歲以上", "公開", "公開組", "大專", "社會組", "公開男子組", "公開女子組"],
+            "高中": ["高中", "高男", "高女"],
+            "國中": ["國中", "國男", "國女", "國中男子組", "國中女子組"],
+            "國小高年級": ["國小高年級", "小高", "小高年級"],
+            "國小中年級": ["國小中年級", "小中", "小中年級"],
+            "國小低年級": ["國小低年級", "小低", "小低年級"],
+        }
+
+        def best_in_year(group_name: str, y: Optional[int]) -> Optional[float]:
+            # 允許關鍵字出現在「組別」或「項目」
+            aliases = GROUP_ALIASES.get(group_name, [group_name])
+            like_clauses = []
+            params: Dict[str, Any] = {"g": gender, "pat": pat}
+
+            for idx, kw in enumerate(aliases):
+                k = f"kw{idx}"
+                params[k] = f"%{kw}%"
+                like_clauses.append(f'("組別" ILIKE :{k} OR "項目" ILIKE :{k})')
+
             where = [
                 '"性別" = :g',
                 '"項目" ILIKE :pat',
-                '"組別" ILIKE :grp',
+                f"({' OR '.join(like_clauses)})",
+                # 排冬季短水道（與你現有邏輯一致）
                 '("賽事名稱" NOT ILIKE \'%冬季短水道%\' AND NOT ("賽事名稱" ILIKE \'%短水道%\' AND "賽事名稱" ILIKE \'%冬%\'))',
             ]
-            params = {"g": gender, "pat": pat, "grp": f"%{group_kw}%"}
             if y is not None:
                 where.append('"年份"::text LIKE :y||\'%\'')
                 params["y"] = str(y)
+
             sql = f"""
                 SELECT MIN(sec) FROM (
                   SELECT CASE
                     WHEN POSITION(':' IN "成績"::text)>0
-                    THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
-                    ELSE NULLIF("成績"::text,'')::float END AS sec,
-                    "賽事名稱"::text AS m
+                      THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
+                      ELSE NULLIF("成績"::text,'')::float
+                  END AS sec
                   FROM {TABLE}
                   WHERE {" AND ".join(where)}
                 ) t
@@ -555,13 +576,12 @@ def groups_api(
             return float(v) if v else None
 
         out = []
-        for g in GROUPS:
+        for group_name in GROUP_ALIASES.keys():
             bars = []
-            all_time = best_in_year(g, None)
-            bars.append({"label": "All-Time", "seconds": all_time})
+            bars.append({"label": "All-Time", "seconds": best_in_year(group_name, None)})
             for y in YEARS:
-                bars.append({"label": str(y), "seconds": best_in_year(g, y)})
-            out.append({"group": g, "bars": bars})
+                bars.append({"label": str(y), "seconds": best_in_year(group_name, y)})
+            out.append({"group": group_name, "bars": bars})
 
         return {"gender": gender, "groups": out}
     except Exception as e:
