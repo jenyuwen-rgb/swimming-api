@@ -500,7 +500,40 @@ def rank_api(
     }
 
 # ----------------- /groups （各分組：歷史最快＋近三年最快） -----------------
-# ----------------- /groups （各分組：歷史最快＋近三年最快） -----------------
+
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from typing import List, Dict, Any, Optional, Tuple
+import re, datetime
+from .db import SessionLocal
+
+router = APIRouter()
+TABLE = "swimming_scores"
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def parse_seconds(s: Optional[str]) -> Optional[float]:
+    if not s: return None
+    s = str(s).strip()
+    try:
+        if ":" in s:
+            m, sec = s.split(":")
+            return int(m)*60 + float(sec)
+        return float(s)
+    except Exception:
+        return None
+
+def is_winter_short_course(meet: str) -> bool:
+    if not meet: return False
+    s = str(meet)
+    return ("冬季短水道" in s) or ("短水道" in s and "冬" in s)
+
 @router.get("/groups")
 def groups_api(
     name: str = Query(...),
@@ -508,13 +541,12 @@ def groups_api(
     db: Session = Depends(get_db),
 ):
     """
-    回傳各分組 4 根柱：
-    - 'All-Time'：資料庫內該分組(關鍵字可在【組別】或【項目】欄)＋同性別＋同泳程 的歷史最快（排除冬季短水道）
-    - This Year / Last-1 / Last-2：該年份該分組的最快（排除冬季短水道）
-    * 同『輸入選手性別』。
+    各分組回傳 4~5 根柱（All-Time、近三年、你(若有)）。
+    分組關鍵字在「組別」或「項目」任何一欄命中即算，排除冬季短水道。
+    每根柱提供 seconds/name/year/meet/isSelf 供前端 Tooltip。
     """
     try:
-        # 先找輸入選手性別
+        # 取輸入選手性別
         row = db.execute(text(f"""
             SELECT NULLIF("性別"::text,'') AS g
             FROM {TABLE} WHERE "姓名"=:n
@@ -526,63 +558,92 @@ def groups_api(
 
         THIS = datetime.date.today().year
         YEARS = [THIS, THIS-1, THIS-2]
+        GROUPS = ["18以上","高中","國中","國小高年級","國小中年級","國小低年級"]
         pat = f"%{stroke.strip()}%"
 
-        # 分組→關鍵字別名（你可視資料再擴充）
-        GROUP_ALIASES = {
-            "18以上": ["18以上", "18歲以上", "公開", "公開組", "大專", "社會組", "公開男子組", "公開女子組"],
-            "高中": ["高中", "高男", "高女"],
-            "國中": ["國中", "國男", "國女", "國中男子組", "國中女子組"],
-            "國小高年級": ["國小高年級", "小高", "小高年級"],
-            "國小中年級": ["國小中年級", "小中", "小中年級"],
-            "國小低年級": ["國小低年級", "小低", "小低年級"],
-        }
-
-        def best_in_year(group_name: str, y: Optional[int]) -> Optional[float]:
-            # 允許關鍵字出現在「組別」或「項目」
-            aliases = GROUP_ALIASES.get(group_name, [group_name])
-            like_clauses = []
-            params: Dict[str, Any] = {"g": gender, "pat": pat}
-
-            for idx, kw in enumerate(aliases):
-                k = f"kw{idx}"
-                params[k] = f"%{kw}%"
-                like_clauses.append(f'("組別" ILIKE :{k} OR "項目" ILIKE :{k})')
-
+        # 基礎 where（組別 or 項目 命中 group_kw）
+        def base_where(group_kw: str) -> Tuple[str, Dict[str, Any]]:
             where = [
                 '"性別" = :g',
                 '"項目" ILIKE :pat',
-                f"({' OR '.join(like_clauses)})",
-                # 排冬季短水道（與你現有邏輯一致）
+                '( "組別" ILIKE :grp OR "項目" ILIKE :grp )',
                 '("賽事名稱" NOT ILIKE \'%冬季短水道%\' AND NOT ("賽事名稱" ILIKE \'%短水道%\' AND "賽事名稱" ILIKE \'%冬%\'))',
             ]
+            params = {"g": gender, "pat": pat, "grp": f"%{group_kw}%"}
+            return " AND ".join(where), params
+
+        # 該分組＋特定年份的最快（含姓名/年/賽事）
+        def best_in_year(group_kw: str, y: Optional[int]) -> Optional[Dict[str, Any]]:
+            where_str, params = base_where(group_kw)
             if y is not None:
-                where.append('"年份"::text LIKE :y||\'%\'')
+                where_str += ' AND "年份"::text LIKE :y||\'%\''
                 params["y"] = str(y)
-
             sql = f"""
-                SELECT MIN(sec) FROM (
-                  SELECT CASE
+                SELECT
+                  "姓名"::text AS nm,
+                  "年份"::text AS yy,
+                  "賽事名稱"::text AS mm,
+                  CASE
                     WHEN POSITION(':' IN "成績"::text)>0
-                      THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
-                      ELSE NULLIF("成績"::text,'')::float
+                    THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
+                    ELSE NULLIF("成績"::text,'')::float
                   END AS sec
-                  FROM {TABLE}
-                  WHERE {" AND ".join(where)}
-                ) t
-                WHERE sec IS NOT NULL AND sec>0
+                FROM {TABLE}
+                WHERE {where_str}
+                ORDER BY sec ASC NULLS LAST
+                LIMIT 1
             """
-            v = db.execute(text(sql), params).scalar()
-            return float(v) if v else None
+            r = db.execute(text(sql), params).mappings().first()
+            if not r or r["sec"] is None or r["sec"] <= 0:
+                return None
+            return {"seconds": float(r["sec"]), "name": r["nm"], "year": r["yy"], "meet": r["mm"], "isSelf": (r["nm"] == name)}
 
-        out = []
-        for group_name in GROUP_ALIASES.keys():
-            bars = []
-            bars.append({"label": "All-Time", "seconds": best_in_year(group_name, None)})
+        # 輸入選手在該分組的 PB（不限年份）
+        def self_best(group_kw: str) -> Optional[Dict[str, Any]]:
+            where_str, params = base_where(group_kw)
+            where_str += ' AND "姓名" = :self'
+            params["self"] = name
+            sql = f"""
+                SELECT
+                  "姓名"::text AS nm,
+                  "年份"::text AS yy,
+                  "賽事名稱"::text AS mm,
+                  CASE
+                    WHEN POSITION(':' IN "成績"::text)>0
+                    THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
+                    ELSE NULLIF("成績"::text,'')::float
+                  END AS sec
+                FROM {TABLE}
+                WHERE {where_str}
+                ORDER BY sec ASC NULLS LAST
+                LIMIT 1
+            """
+            r = db.execute(text(sql), params).mappings().first()
+            if not r or r["sec"] is None or r["sec"] <= 0:
+                return None
+            return {"seconds": float(r["sec"]), "name": r["nm"], "year": r["yy"], "meet": r["mm"], "isSelf": True}
+
+        out_groups: List[Dict[str, Any]] = []
+
+        for gkw in GROUPS:
+            bars: List[Dict[str, Any]] = []
+
+            # All-Time
+            at = best_in_year(gkw, None)
+            bars.append({"label": "All-Time", **({"seconds": None} if not at else at)})
+
+            # 近三年
             for y in YEARS:
-                bars.append({"label": str(y), "seconds": best_in_year(group_name, y)})
-            out.append({"group": group_name, "bars": bars})
+                yy = best_in_year(gkw, y)
+                bars.append({"label": str(y), **({"seconds": None} if not yy else yy)})
 
-        return {"gender": gender, "groups": out}
+            # 你（若有）
+            me = self_best(gkw)
+            if me:
+                bars.append({"label": "你", **me})
+
+            out_groups.append({"group": gkw, "bars": bars})
+
+        return {"gender": gender, "groups": out_groups}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"groups failed: {e}")
