@@ -125,17 +125,23 @@ def results(
         COALESCE("性別"::text,'') AS gender,
         COALESCE("出生年"::text,'') AS birth_year
       FROM {TABLE}
-      WHERE "姓名" = :name AND "項目" ILIKE :pat
+      WHERE "姓名" = :name
+        AND "項目" ILIKE :pat
+        AND "項目" NOT ILIKE '%接力%'
+        AND "組別" NOT ILIKE '%接力%'
       ORDER BY "年份" DESC
       LIMIT :limit OFFSET :offset
     """
     rows = db.execute(text(sql), {"name": name, "pat": pat, "limit": limit, "offset": cursor}).mappings().all()
 
-    # 全量 PB（排冬短）
+    # 全量 PB（排冬短 + 排接力）
     sql_all = f"""
-      SELECT "賽事名稱"::text AS m, "成績"::text AS r
+      SELECT "賽事名稱"::text AS m, "成績"::text AS r, "項目"::text AS i, COALESCE("組別"::text,'') AS g
       FROM {TABLE}
-      WHERE "姓名" = :name AND "項目" ILIKE :pat
+      WHERE "姓名" = :name
+        AND "項目" ILIKE :pat
+        AND "項目" NOT ILIKE '%接力%'
+        AND "組別" NOT ILIKE '%接力%'
       ORDER BY "年份" ASC
       LIMIT 5000
     """
@@ -143,6 +149,8 @@ def results(
     pb_sec = None
     for rr in all_rows:
       if is_winter_short_course(rr["m"]): 
+        continue
+      if "接力" in (rr["i"] or "") or "接力" in (rr["g"] or ""):
         continue
       s = parse_seconds(rr["r"])
       if s is None or s <= 0:
@@ -152,6 +160,8 @@ def results(
 
     items: List[Dict[str, Any]] = []
     for r in rows:
+      if "接力" in (r["i"] or "") or "接力" in (r["g"] or ""):
+        continue
       sec = parse_seconds(r["r"])
       items.append({
         "年份": r["y"], "賽事名稱": r["m"], "項目": r["i"], "姓名": r["n"],
@@ -170,9 +180,12 @@ def pb(name: str = Query(...), stroke: str = Query(...), db: Session = Depends(g
   try:
     pat = f"%{stroke.strip()}%"
     sql = f"""
-      SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+      SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r, "項目"::text AS i, COALESCE("組別"::text,'') AS g
       FROM {TABLE}
-      WHERE "姓名" = :name AND "項目" ILIKE :pat
+      WHERE "姓名" = :name
+        AND "項目" ILIKE :pat
+        AND "項目" NOT ILIKE '%接力%'
+        AND "組別" NOT ILIKE '%接力%'
       ORDER BY "年份" ASC
       LIMIT 5000
     """
@@ -180,6 +193,8 @@ def pb(name: str = Query(...), stroke: str = Query(...), db: Session = Depends(g
     best = None  # (sec, y, m)
     for r in rows:
       if is_winter_short_course(r["m"]):
+        continue
+      if "接力" in (r["i"] or "") or "接力" in (r["g"] or ""):
         continue
       s = parse_seconds(r["r"])
       if s is None or s <= 0:
@@ -204,11 +219,14 @@ def summary(
 ):
   pat = f"%{stroke.strip()}%"
 
-  # 全量資料（算 analysis 與 trend）
+  # 全量資料（算 analysis 與 trend；排冬短＋接力）
   sql_all = f"""
-    SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+    SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r, "項目"::text AS i, COALESCE("組別"::text,'') AS g
     FROM {TABLE}
-    WHERE "姓名" = :name AND "項目" ILIKE :pat
+    WHERE "姓名" = :name
+      AND "項目" ILIKE :pat
+      AND "項目" NOT ILIKE '%接力%'
+      AND "組別" NOT ILIKE '%接力%'
     ORDER BY "年份" ASC
     LIMIT 5000
   """
@@ -216,15 +234,25 @@ def summary(
 
   vals, pb_sec = [], None
   for r in all_rows:
+    if is_winter_short_course(r["m"]):
+      continue
+    if "接力" in (r["i"] or "") or "接力" in (r["g"] or ""):
+      continue
     s = parse_seconds(r["r"])
     if s is not None and s > 0:
       vals.append(s)
-      if not is_winter_short_course(r["m"]):
-        pb_sec = s if pb_sec is None or s < pb_sec else pb_sec
+      pb_sec = s if pb_sec is None or s < pb_sec else pb_sec
 
-  trend_points = [{"year": r["y"], "seconds": parse_seconds(r["r"])} for r in all_rows if parse_seconds(r["r"])]
+  trend_points = []
+  for r in all_rows:
+    if is_winter_short_course(r["m"]): 
+      continue
+    if "接力" in (r["i"] or "") or "接力" in (r["g"] or ""):
+      continue
+    s = parse_seconds(r["r"])
+    if s: trend_points.append({"year": r["y"], "seconds": s})
 
-  # 分頁明細（倒序，並標 is_pb）＋ 性別/出生年
+  # 分頁明細（倒序，並標 is_pb）＋ 性別/出生年；排接力
   sql_page = f"""
     SELECT "年份"::text AS y,"賽事名稱"::text AS m,"項目"::text AS i,
            "成績"::text AS r,"姓名"::text AS n,
@@ -234,7 +262,10 @@ def summary(
            COALESCE("性別"::text,'') AS gender,
            COALESCE("出生年"::text,'') AS birth_year
     FROM {TABLE}
-    WHERE "姓名" = :name AND "項目" ILIKE :pat
+    WHERE "姓名" = :name
+      AND "項目" ILIKE :pat
+      AND "項目" NOT ILIKE '%接力%'
+      AND "組別" NOT ILIKE '%接力%'
     ORDER BY "年份" DESC
     LIMIT :limit OFFSET :offset
   """
@@ -254,6 +285,8 @@ def summary(
 
   items = []
   for r in page_rows:
+    if "接力" in (r["i"] or "") or "接力" in (r["g"] or ""):
+      continue
     sec = parse_seconds(r["r"])
     items.append({
       "年份": r["y"], "賽事名稱": r["m"], "項目": r["i"], "姓名": r["n"],
@@ -267,40 +300,45 @@ def summary(
   wa_pts = wa_points(gender, pool, stroke, pb_sec)
 
   analysis = {
-    "meetCount": len(all_rows),
+    "meetCount": len([r for r in all_rows if parse_seconds(r["r"]) and not is_winter_short_course(r["m"])]),
     "avg_seconds": (sum(vals) / len(vals)) if vals else None,
     "pb_seconds": pb_sec,
     "wa_points": wa_pts,
   }
 
-  # ---- 四式專項統計 ----
+  # ---- 四式專項統計（排冬短＋接力）----
   family_out: Dict[str, Any] = {}
   for fam in ["蛙式", "仰式", "自由式", "蝶式"]:
     pf = f"%{fam}%"
     q = f"""
       SELECT "年份"::text AS y, "賽事名稱"::text AS m,
-             "成績"::text AS r, "項目"::text AS i
+             "成績"::text AS r, "項目"::text AS i, COALESCE("組別"::text,'') AS g
       FROM {TABLE}
-      WHERE "姓名" = :name AND "項目" ILIKE :pf
+      WHERE "姓名" = :name
+        AND "項目" ILIKE :pf
+        AND "項目" NOT ILIKE '%接力%'
+        AND "組別" NOT ILIKE '%接力%'
       ORDER BY "年份" ASC
       LIMIT 5000
     """
     rows = db.execute(text(q), {"name": name, "pf": pf}).mappings().all()
 
-    count = len(rows)
+    count = 0
     dist_count: Dict[str, int] = {}
     best_by_dist: Dict[str, Tuple[float, str, str]] = {}
 
     for row in rows:
+      if "接力" in (row["i"] or "") or "接力" in (row["g"] or ""):
+        continue
       m = re.search(r"(\d+)\s*公尺", str(row["i"] or ""))
       dist = f"{m.group(1)}公尺" if m else ""
-      if dist:
-        dist_count[dist] = dist_count.get(dist, 0) + 1
-
       s = parse_seconds(row["r"])
+      if s is not None and s > 0:
+        count += 1
       if s is None or s <= 0 or is_winter_short_course(row["m"]):
         continue
       if dist:
+        dist_count[dist] = dist_count.get(dist, 0) + 1
         cur = best_by_dist.get(dist)
         if cur is None or s < cur[0]:
           best_by_dist[dist] = (s, row["y"], row["m"])
@@ -364,8 +402,8 @@ def rank_api(
   t0 = db.execute(text(t0_sql), {"name": name, "pat": pat}).scalar()
   t0 = str(t0) if t0 else None
 
-  # 建立對手池（同泳姿＋距離）
-  where_clauses = ['"項目" ILIKE :pat', '"姓名" <> :name']
+  # 建立對手池（同泳姿＋距離；不需特別排接力，因為 stroke 已限定；保險起見仍排除）
+  where_clauses = ['"項目" ILIKE :pat', '"姓名" <> :name', '"項目" NOT ILIKE \'%接力%\'', '"組別" NOT ILIKE \'%接力%\'']
   params: Dict[str, Any] = {"pat": pat, "name": name}
   if gender:
     where_clauses.append('COALESCE("性別"::text, \'\') = :gender')
@@ -391,9 +429,12 @@ def rank_api(
 
   def best_of(player: str) -> Optional[Tuple[float, str, str]]:
     q = f"""
-      SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+      SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r, "項目"::text AS i, COALESCE("組別"::text,'') AS g
       FROM {TABLE}
-      WHERE "姓名"=:p AND "項目" ILIKE :pat
+      WHERE "姓名"=:p
+        AND "項目" ILIKE :pat
+        AND "項目" NOT ILIKE '%接力%'
+        AND "組別" NOT ILIKE '%接力%'
       ORDER BY "年份" ASC
       LIMIT 5000
     """
@@ -403,6 +444,8 @@ def rank_api(
       if t0 and str(row["y"]) < t0:
         continue
       if is_winter_short_course(row["m"]):
+        continue
+      if "接力" in (row["i"] or "") or "接力" in (row["g"] or ""):
         continue
       s = parse_seconds(row["r"])
       if s is None or s <= 0:
@@ -421,8 +464,8 @@ def rank_api(
     return {"denominator": 0, "rank": None, "percentile": None, "leader": None, "you": None, "top": [], "leaderTrend": []}
 
   board.sort(key=lambda x: x["pb_seconds"])
-  for i, row in enumerate(board, start=1):
-    row["rank"] = i
+  for i, row2 in enumerate(board, start=1):
+    row2["rank"] = i
 
   denominator = len(board)
   you = next((x for x in board if x["name"] == name), None)
@@ -431,22 +474,29 @@ def rank_api(
   leader = board[0]
   top10 = board[:10]
 
-  # 領先者趨勢（仍套 t0 與排冬短）
+  # 領先者趨勢（排冬短＋接力）
   leader_trend: List[Dict[str, Any]] = []
   q_leader = f"""
-    SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r
+    SELECT "年份"::text AS y, "賽事名稱"::text AS m, "成績"::text AS r, "項目"::text AS i, COALESCE("組別"::text,'') AS g
     FROM {TABLE}
-    WHERE "姓名" = :p AND "項目" ILIKE :pat
+    WHERE "姓名" = :p
+      AND "項目" ILIKE :pat
+      AND "項目" NOT ILIKE '%接力%'
+      AND "組別" NOT ILIKE '%接力%'
     ORDER BY "年份" ASC
     LIMIT 5000
   """
-  for row in db.execute(text(q_leader), {"p": leader["name"], "pat": pat}).mappings():
-    if t0 and str(row["y"]) < t0:
+  for row3 in db.execute(text(q_leader), {"p": leader["name"], "pat": pat}).mappings():
+    if t0 and str(row3["y"]) < t0:
       continue
-    s = parse_seconds(row["r"])
+    if is_winter_short_course(row3["m"]):
+      continue
+    if "接力" in (row3["i"] or "") or "接力" in (row3["g"] or ""):
+      continue
+    s = parse_seconds(row3["r"])
     if s is None or s <= 0:
       continue
-    leader_trend.append({"year": row["y"], "seconds": s, "meet": row["m"]})
+    leader_trend.append({"year": row3["y"], "seconds": s, "meet": row3["m"]})
 
   return {
     "denominator": denominator,
@@ -487,8 +537,7 @@ def groups_api(
     GROUPS = ["18以上","高中","國中","國小高年級","國小中年級","國小低年級"]
     pat = f"%{stroke.strip()}%"
 
-    # 為了縮小掃描範圍，先在 SQL 側過濾掉不可能的 rows（性別/泳程/排冬短/分組關鍵字）
-    # 將各 group 關鍵字組成 OR 條件（同時比對「組別」或「項目」）
+    # SQL 側先排：性別/泳程/冬短/接力/分組關鍵字
     or_parts = []
     params = {"gender": gender, "pat": pat}
     for i, kw in enumerate(GROUPS):
@@ -512,18 +561,22 @@ def groups_api(
       WHERE "性別" = :gender
         AND "項目" ILIKE :pat
         AND {group_filter_sql}
+        AND "項目" NOT ILIKE '%接力%'
+        AND "組別" NOT ILIKE '%接力%'
         AND ("賽事名稱" NOT ILIKE '%冬季短水道%'
              AND NOT ("賽事名稱" ILIKE '%短水道%' AND "賽事名稱" ILIKE '%冬%'))
     """
     rows = db.execute(text(sql), params).mappings().all()
 
-    # 將 rows 依據關鍵字分桶（同一筆若同時命中多個 group 關鍵字，會分別進入）
+    # 分桶（同一筆若同時命中多個 group 關鍵字，會分別進入）
     buckets: dict[str, list[dict]] = {g: [] for g in GROUPS}
     for r in rows:
       grptext = (r["grptext"] or "").strip()
       itemtext = (r["itemtext"] or "").strip()
       for gkw in GROUPS:
         if (gkw in grptext) or (gkw in itemtext):
+          if ("接力" in grptext) or ("接力" in itemtext):
+            continue
           sec = r["sec"]
           if sec is None or sec <= 0:
             continue
