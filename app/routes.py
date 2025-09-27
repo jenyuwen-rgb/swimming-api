@@ -466,99 +466,118 @@ def groups_api(
   db: Session = Depends(get_db),
 ):
   """
-  各分組回傳 4~5 根柱（All-Time、近三年、你(若有)）。
-  分組關鍵字在「組別」或「項目」任何一欄命中即算，排除冬季短水道。
-  每根柱提供 seconds/name/year/meet/isSelf 供前端 Tooltip。
+  一次抓齊資料、Python 端完成分組彙整，避免每個 group/year 再打多次 SQL。
+  回傳結構不變：{ gender, groups: [ {group, bars:[{label,seconds,name,year,meet,isSelf}...] } ] }
   """
   try:
     # 取輸入選手性別
-    row = db.execute(text(f"""
+    row = db.execute(text("""
       SELECT NULLIF("性別"::text,'') AS g
-      FROM {TABLE} WHERE "姓名"=:n
-      ORDER BY "年份" DESC LIMIT 1
+      FROM swimming_scores
+      WHERE "姓名"=:n
+      ORDER BY "年份" DESC
+      LIMIT 1
     """), {"n": name}).mappings().first()
     gender = row["g"] if row and row["g"] else None
     if not gender:
       return {"gender": None, "groups": []}
 
     THIS = datetime.date.today().year
-    YEARS = [THIS, THIS-1, THIS-2]
+    YEARS = [str(THIS), str(THIS-1), str(THIS-2)]
     GROUPS = ["18以上","高中","國中","國小高年級","國小中年級","國小低年級"]
     pat = f"%{stroke.strip()}%"
 
-    # 基礎 where（組別 or 項目 命中 group_kw）
-    def base_where(group_kw: str) -> Tuple[str, Dict[str, Any]]:
-      where = [
-        '"性別" = :g',
-        '"項目" ILIKE :pat',
-        '( "組別" ILIKE :grp OR "項目" ILIKE :grp )',
-        '("賽事名稱" NOT ILIKE \'%冬季短水道%\' AND NOT ("賽事名稱" ILIKE \'%短水道%\' AND "賽事名稱" ILIKE \'%冬%\'))',
-      ]
-      params = {"g": gender, "pat": pat, "grp": f"%{group_kw}%"}
-      return " AND ".join(where), params
+    # 為了縮小掃描範圍，先在 SQL 側過濾掉不可能的 rows（性別/泳程/排冬短/分組關鍵字）
+    # 將各 group 關鍵字組成 OR 條件（同時比對「組別」或「項目」）
+    or_parts = []
+    params = {"gender": gender, "pat": pat}
+    for i, kw in enumerate(GROUPS):
+      params[f"g{i}"] = f"%{kw}%"
+      or_parts.append(f'("組別" ILIKE :g{i} OR "項目" ILIKE :g{i})')
+    group_filter_sql = "(" + " OR ".join(or_parts) + ")"
 
-    def best_in_year(group_kw: str, y: Optional[int]) -> Optional[Dict[str, Any]]:
-      where_str, params = base_where(group_kw)
-      if y is not None:
-        where_str += ' AND "年份"::text LIKE :y||\'%\''
-        params["y"] = str(y)
-      sql = f"""
-        SELECT
-          "姓名"::text AS nm,
-          "年份"::text AS yy,
-          "賽事名稱"::text AS mm,
-          CASE
-            WHEN POSITION(':' IN "成績"::text)>0
-            THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
-            ELSE NULLIF("成績"::text,'')::float
-          END AS sec
-        FROM {TABLE}
-        WHERE {where_str}
-        ORDER BY sec ASC NULLS LAST
-        LIMIT 1
-      """
-      r = db.execute(text(sql), params).mappings().first()
-      if not r or r["sec"] is None or r["sec"] <= 0:
-        return None
-      return {"seconds": float(r["sec"]), "name": r["nm"], "year": r["yy"], "meet": r["mm"], "isSelf": (r["nm"] == name)}
+    sql = f"""
+      SELECT
+        "組別"::text  AS grptext,
+        "項目"::text  AS itemtext,
+        "姓名"::text  AS nm,
+        "年份"::text  AS yy,
+        "賽事名稱"::text AS mm,
+        CASE
+          WHEN POSITION(':' IN "成績"::text)>0
+          THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
+          ELSE NULLIF("成績"::text,'')::float
+        END AS sec
+      FROM {TABLE}
+      WHERE "性別" = :gender
+        AND "項目" ILIKE :pat
+        AND {group_filter_sql}
+        AND ("賽事名稱" NOT ILIKE '%冬季短水道%'
+             AND NOT ("賽事名稱" ILIKE '%短水道%' AND "賽事名稱" ILIKE '%冬%'))
+    """
+    rows = db.execute(text(sql), params).mappings().all()
 
-    def self_best(group_kw: str) -> Optional[Dict[str, Any]]:
-      where_str, params = base_where(group_kw)
-      where_str += ' AND "姓名" = :self'
-      params["self"] = name
-      sql = f"""
-        SELECT
-          "姓名"::text AS nm,
-          "年份"::text AS yy,
-          "賽事名稱"::text AS mm,
-          CASE
-            WHEN POSITION(':' IN "成績"::text)>0
-            THEN SPLIT_PART("成績"::text,':',1)::int*60 + SPLIT_PART("成績"::text,':',2)::float
-            ELSE NULLIF("成績"::text,'')::float
-          END AS sec
-        FROM {TABLE}
-        WHERE {where_str}
-        ORDER BY sec ASC NULLS LAST
-        LIMIT 1
-      """
-      r = db.execute(text(sql), params).mappings().first()
-      if not r or r["sec"] is None or r["sec"] <= 0:
-        return None
-      return {"seconds": float(r["sec"]), "name": r["nm"], "year": r["yy"], "meet": r["mm"], "isSelf": True}
+    # 將 rows 依據關鍵字分桶（同一筆若同時命中多個 group 關鍵字，會分別進入）
+    buckets: dict[str, list[dict]] = {g: [] for g in GROUPS}
+    for r in rows:
+      grptext = (r["grptext"] or "").strip()
+      itemtext = (r["itemtext"] or "").strip()
+      for gkw in GROUPS:
+        if (gkw in grptext) or (gkw in itemtext):
+          sec = r["sec"]
+          if sec is None or sec <= 0:
+            continue
+          buckets[gkw].append({
+            "name": r["nm"],
+            "year": r["yy"],
+            "meet": r["mm"],
+            "seconds": float(sec),
+          })
 
-    out_groups: List[Dict[str, Any]] = []
+    # 對每個 group 求：All-Time 最佳、近三年最佳、你的最佳
+    out_groups = []
     for gkw in GROUPS:
-      bars: List[Dict[str, Any]] = []
-      at = best_in_year(gkw, None)
-      bars.append({"label": "All-Time", **({"seconds": None} if not at else at)})
-      for y in YEARS:
-        yy = best_in_year(gkw, y)
-        bars.append({"label": str(y), **({"seconds": None} if not yy else yy)})
-      me = self_best(gkw)
-      if me:
-        bars.append({"label": "你", **me})
+      arr = buckets.get(gkw, [])
+      bars = []
+
+      # All-Time
+      at = min(arr, key=lambda x: x["seconds"]) if arr else None
+      bars.append({
+        "label": "All-Time",
+        **({"seconds": None} if not at else {
+          "seconds": at["seconds"], "name": at["name"], "year": at["year"], "meet": at["meet"],
+          "isSelf": (at["name"] == name)
+        })
+      })
+
+      # 近三年
+      for yy in YEARS:
+        cand = [x for x in arr if str(x["year"]).startswith(yy)]
+        best = min(cand, key=lambda x: x["seconds"]) if cand else None
+        bars.append({
+          "label": yy,
+          **({"seconds": None} if not best else {
+            "seconds": best["seconds"], "name": best["name"], "year": best["year"], "meet": best["meet"],
+            "isSelf": (best["name"] == name)
+          })
+        })
+
+      # 你（若有）
+      mine = [x for x in arr if x["name"] == name]
+      if mine:
+        mebest = min(mine, key=lambda x: x["seconds"])
+        bars.append({
+          "label": "你",
+          "seconds": mebest["seconds"],
+          "name": mebest["name"],
+          "year": mebest["year"],
+          "meet": mebest["meet"],
+          "isSelf": True
+        })
+
       out_groups.append({"group": gkw, "bars": bars})
 
     return {"gender": gender, "groups": out_groups}
+
   except Exception as e:
     raise HTTPException(status_code=500, detail=f"groups failed: {e}")
