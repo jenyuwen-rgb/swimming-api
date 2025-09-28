@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
+# app/routes.py
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional, Tuple
@@ -96,6 +97,34 @@ def wa_points(gender: Optional[str], pool: int, item: str, seconds: Optional[flo
   except Exception:
     return None
 
+# ----------------- Query logging helpers -----------------
+def _client_ip(req: Request) -> str:
+  xff = req.headers.get("x-forwarded-for") or req.headers.get("X-Forwarded-For")
+  if xff:
+    return xff.split(",")[0].strip()
+  return req.client.host if req.client else ""
+
+def log_query(db: Session, req: Request, endpoint: str, *, name: str, stroke: str, pool: Optional[int] = None, cursor: Optional[int] = None) -> None:
+  try:
+    db.execute(
+      text("""
+        INSERT INTO query_logs (ip, endpoint, name, stroke, pool, cursor, user_agent)
+        VALUES (:ip, :endpoint, :name, :stroke, :pool, :cursor, :ua)
+      """),
+      {
+        "ip": _client_ip(req),
+        "endpoint": endpoint,
+        "name": name,
+        "stroke": stroke,
+        "pool": pool,
+        "cursor": cursor,
+        "ua": req.headers.get("user-agent", "")
+      }
+    )
+    db.commit()
+  except Exception:
+    db.rollback()  # 記錄失敗不影響主流程
+
 # ----------------- health -----------------
 @router.get("/health")
 def health() -> Dict[str, str]:
@@ -104,12 +133,17 @@ def health() -> Dict[str, str]:
 # ----------------- /results -----------------
 @router.get("/results")
 def results(
+  request: Request,
   name: str = Query(...),
   stroke: str = Query(...),
   limit: int = Query(50, ge=1, le=500),
   cursor: int = Query(0, ge=0),
   db: Session = Depends(get_db),
 ):
+  # 可選：若也想記錄 /results 查詢，把下一行解除註解
+  # if request.method == "GET" and cursor == 0:
+  #   log_query(db, request, "/api/results", name=name, stroke=stroke, pool=None, cursor=cursor)
+
   try:
     pat = f"%{stroke.strip()}%"
     sql = f"""
@@ -176,7 +210,10 @@ def results(
 
 # ----------------- /pb -----------------
 @router.get("/pb")
-def pb(name: str = Query(...), stroke: str = Query(...), db: Session = Depends(get_db)):
+def pb(request: Request, name: str = Query(...), stroke: str = Query(...), db: Session = Depends(get_db)):
+  # 可選：若想記錄 /pb 也可以
+  # log_query(db, request, "/api/pb", name=name, stroke=stroke, pool=None, cursor=None)
+
   try:
     pat = f"%{stroke.strip()}%"
     sql = f"""
@@ -210,6 +247,7 @@ def pb(name: str = Query(...), stroke: str = Query(...), db: Session = Depends(g
 # ----------------- /summary -----------------
 @router.get("/summary")
 def summary(
+  request: Request,
   name: str = Query(...),
   stroke: str = Query(...),
   pool: int = Query(50, ge=25, le=50, description="WA points 池別：50=長水道，25=短水道"),
@@ -217,6 +255,10 @@ def summary(
   cursor: int = Query(0, ge=0),
   db: Session = Depends(get_db),
 ):
+  # 只在第一頁（cursor==0）記錄一次，等同「按下查詢」
+  if request.method == "GET" and cursor == 0:
+    log_query(db, request, "/api/summary", name=name, stroke=stroke, pool=pool, cursor=cursor)
+
   pat = f"%{stroke.strip()}%"
 
   # 全量資料（算 analysis 與 trend；排冬短＋接力）
@@ -372,11 +414,16 @@ def summary(
 # ----------------- /rank -----------------
 @router.get("/rank")
 def rank_api(
+  request: Request,
   name: str = Query(...),
   stroke: str = Query(...),
   ageTol: int = Query(1, ge=0, le=5, description="年齡誤差；0=同年、1=±1"),
   db: Session = Depends(get_db),
 ):
+  # 每次進來都記錄
+  if request.method == "GET":
+    log_query(db, request, "/api/rank", name=name, stroke=stroke, pool=None, cursor=None)
+
   pat = f"%{stroke.strip()}%"
 
   # 取得輸入選手的性別與出生年
@@ -402,7 +449,6 @@ def rank_api(
   t0 = db.execute(text(t0_sql), {"name": name, "pat": pat}).scalar()
   t0 = str(t0) if t0 else None
 
-  # 建立對手池（同泳姿＋距離；不需特別排接力，因為 stroke 已限定；保險起見仍排除）
   where_clauses = ['"項目" ILIKE :pat', '"姓名" <> :name', '"項目" NOT ILIKE \'%接力%\'', '"組別" NOT ILIKE \'%接力%\'']
   params: Dict[str, Any] = {"pat": pat, "name": name}
   if gender:
@@ -511,10 +557,15 @@ def rank_api(
 # ----------------- /groups -----------------
 @router.get("/groups")
 def groups_api(
+  request: Request,
   name: str = Query(...),
   stroke: str = Query(...),
   db: Session = Depends(get_db),
 ):
+  # 每次進來都記錄
+  if request.method == "GET":
+    log_query(db, request, "/api/groups", name=name, stroke=stroke, pool=None, cursor=None)
+
   """
   一次抓齊資料、Python 端完成分組彙整，避免每個 group/year 再打多次 SQL。
   回傳結構不變：{ gender, groups: [ {group, bars:[{label,seconds,name,year,meet,isSelf}...] } ] }
@@ -634,3 +685,30 @@ def groups_api(
 
   except Exception as e:
     raise HTTPException(status_code=500, detail=f"groups failed: {e}")
+
+# ----------------- （可選）查詢統計 -----------------
+@router.get("/stats/query-overview")
+def query_overview(
+  days: int = Query(30, ge=1, le=365),
+  db: Session = Depends(get_db),
+):
+  rows_total = db.execute(text("""
+    SELECT COUNT(*)::bigint
+    FROM query_logs
+    WHERE ts >= now() - (:days || ' days')::interval
+  """), {"days": days}).scalar() or 0
+
+  rows_by_player = db.execute(text("""
+    SELECT COALESCE(name,'') AS name, COUNT(*)::bigint AS cnt
+    FROM query_logs
+    WHERE ts >= now() - (:days || ' days')::interval
+    GROUP BY COALESCE(name,'')
+    ORDER BY cnt DESC
+    LIMIT 50
+  """), {"days": days}).mappings().all()
+
+  return {
+    "since_days": days,
+    "total": int(rows_total),
+    "top_players": [{"name": r["name"], "count": int(r["cnt"])} for r in rows_by_player],
+  }
