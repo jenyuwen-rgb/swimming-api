@@ -97,6 +97,63 @@ def wa_points(gender: Optional[str], pool: int, item: str, seconds: Optional[flo
   except Exception:
     return None
 
+# ----------------- 分組年齡推論 -----------------
+AGE_GROUP_RULES = [
+  (7, 8, "國小低年級"),
+  (9, 10, "國小中年級"),
+  (11, 12, "國小高年級"),
+  (13, 15, "國中"),
+  (16, 18, "高中"),
+  (19, 200, "18以上"),
+]
+
+def _age_to_bucket(age: int) -> str:
+  for lo, hi, label in AGE_GROUP_RULES:
+    if lo <= age <= hi:
+      return label
+  return "18以上"
+
+_age_span_pat = re.compile(r'(\d+)\s*[~\-–]\s*(\d+)\s*歲')
+_age_single_pat = re.compile(r'(\d+)\s*歲\s*(級)?')
+_age_below_pat = re.compile(r'(\d+)\s*歲\s*(及以下|以下)')
+_age_above_pat = re.compile(r'(\d+)\s*歲\s*(及以上|以上)')
+
+def infer_group_from_text(grptext: str, itemtext: str) -> Optional[str]:
+  s = f"{grptext or ''} {itemtext or ''}"
+
+  # 關鍵字優先
+  for kw in ["18以上","高中","國中","國小高年級","國小中年級","國小低年級"]:
+    if kw in s:
+      return kw
+
+  # 區間
+  m = _age_span_pat.search(s)
+  if m:
+    lo = int(m.group(1)); hi = int(m.group(2))
+    lo, hi = min(lo, hi), max(lo, hi)
+    mid = (lo + hi) // 2
+    return _age_to_bucket(mid)
+
+  # 以下
+  m = _age_below_pat.search(s)
+  if m:
+    hi = int(m.group(1))
+    return _age_to_bucket(hi)
+
+  # 以上
+  m = _age_above_pat.search(s)
+  if m:
+    lo = int(m.group(1))
+    return "18以上" if lo >= 19 else _age_to_bucket(lo)
+
+  # 單一
+  m = _age_single_pat.search(s)
+  if m:
+    age = int(m.group(1))
+    return _age_to_bucket(age)
+
+  return None
+
 # ----------------- Query logging helpers -----------------
 def _client_ip(req: Request) -> str:
   xff = req.headers.get("x-forwarded-for") or req.headers.get("X-Forwarded-For")
@@ -140,10 +197,6 @@ def results(
   cursor: int = Query(0, ge=0),
   db: Session = Depends(get_db),
 ):
-  # 可選：若也想記錄 /results 查詢，把下一行解除註解
-  # if request.method == "GET" and cursor == 0:
-  #   log_query(db, request, "/api/results", name=name, stroke=stroke, pool=None, cursor=cursor)
-
   try:
     pat = f"%{stroke.strip()}%"
     sql = f"""
@@ -211,9 +264,6 @@ def results(
 # ----------------- /pb -----------------
 @router.get("/pb")
 def pb(request: Request, name: str = Query(...), stroke: str = Query(...), db: Session = Depends(get_db)):
-  # 可選：若想記錄 /pb 也可以
-  # log_query(db, request, "/api/pb", name=name, stroke=stroke, pool=None, cursor=None)
-
   try:
     pat = f"%{stroke.strip()}%"
     sql = f"""
@@ -420,7 +470,6 @@ def rank_api(
   ageTol: int = Query(1, ge=0, le=5, description="年齡誤差；0=同年、1=±1"),
   db: Session = Depends(get_db),
 ):
-  # 每次進來都記錄
   if request.method == "GET":
     log_query(db, request, "/api/rank", name=name, stroke=stroke, pool=None, cursor=None)
 
@@ -562,13 +611,12 @@ def groups_api(
   stroke: str = Query(...),
   db: Session = Depends(get_db),
 ):
-  # 每次進來都記錄
   if request.method == "GET":
     log_query(db, request, "/api/groups", name=name, stroke=stroke, pool=None, cursor=None)
 
   """
-  一次抓齊資料、Python 端完成分組彙整，避免每個 group/year 再打多次 SQL。
-  回傳結構不變：{ gender, groups: [ {group, bars:[{label,seconds,name,year,meet,isSelf}...] } ] }
+  以「組別」或「項目」中的關鍵字與年齡字樣（如 15 ~ 17 歲級）推論組別。
+  回傳：{ gender, groups: [ {group, bars:[{label,seconds,name,year,meet,isSelf}...] } ] }
   """
   try:
     # 取輸入選手性別
@@ -588,14 +636,7 @@ def groups_api(
     GROUPS = ["18以上","高中","國中","國小高年級","國小中年級","國小低年級"]
     pat = f"%{stroke.strip()}%"
 
-    # SQL 側先排：性別/泳程/冬短/接力/分組關鍵字
-    or_parts = []
-    params = {"gender": gender, "pat": pat}
-    for i, kw in enumerate(GROUPS):
-      params[f"g{i}"] = f"%{kw}%"
-      or_parts.append(f'("組別" ILIKE :g{i} OR "項目" ILIKE :g{i})')
-    group_filter_sql = "(" + " OR ".join(or_parts) + ")"
-
+    # 只過濾性別/泳程/排接力/排冬短；分組推論在 Python 端做
     sql = f"""
       SELECT
         "組別"::text  AS grptext,
@@ -611,40 +652,41 @@ def groups_api(
       FROM {TABLE}
       WHERE "性別" = :gender
         AND "項目" ILIKE :pat
-        AND {group_filter_sql}
         AND "項目" NOT ILIKE '%接力%'
         AND "組別" NOT ILIKE '%接力%'
         AND ("賽事名稱" NOT ILIKE '%冬季短水道%'
              AND NOT ("賽事名稱" ILIKE '%短水道%' AND "賽事名稱" ILIKE '%冬%'))
     """
-    rows = db.execute(text(sql), params).mappings().all()
+    rows = db.execute(text(sql), {"gender": gender, "pat": pat}).mappings().all()
 
-    # 分桶（同一筆若同時命中多個 group 關鍵字，會分別進入）
+    # 分桶
     buckets: dict[str, list[dict]] = {g: [] for g in GROUPS}
     for r in rows:
       grptext = (r["grptext"] or "").strip()
       itemtext = (r["itemtext"] or "").strip()
-      for gkw in GROUPS:
-        if (gkw in grptext) or (gkw in itemtext):
-          if ("接力" in grptext) or ("接力" in itemtext):
-            continue
-          sec = r["sec"]
-          if sec is None or sec <= 0:
-            continue
-          buckets[gkw].append({
-            "name": r["nm"],
-            "year": r["yy"],
-            "meet": r["mm"],
-            "seconds": float(sec),
-          })
+      if ("接力" in grptext) or ("接力" in itemtext):
+        continue
+      sec = r["sec"]
+      if sec is None or sec <= 0:
+        continue
+      bucket = infer_group_from_text(grptext, itemtext)
+      if not bucket:
+        continue
+      if bucket not in buckets:
+        buckets[bucket] = []
+      buckets[bucket].append({
+        "name": r["nm"],
+        "year": r["yy"],
+        "meet": r["mm"],
+        "seconds": float(sec),
+      })
 
-    # 對每個 group 求：All-Time 最佳、近三年最佳、你的最佳
+    # 對每個 group 求：All-Time、今年、去年、前年、你
     out_groups = []
     for gkw in GROUPS:
       arr = buckets.get(gkw, [])
       bars = []
 
-      # All-Time
       at = min(arr, key=lambda x: x["seconds"]) if arr else None
       bars.append({
         "label": "All-Time",
@@ -654,7 +696,6 @@ def groups_api(
         })
       })
 
-      # 近三年
       for yy in YEARS:
         cand = [x for x in arr if str(x["year"]).startswith(yy)]
         best = min(cand, key=lambda x: x["seconds"]) if cand else None
@@ -666,7 +707,6 @@ def groups_api(
           })
         })
 
-      # 你（若有）
       mine = [x for x in arr if x["name"] == name]
       if mine:
         mebest = min(mine, key=lambda x: x["seconds"])
